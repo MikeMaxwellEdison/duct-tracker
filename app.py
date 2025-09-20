@@ -415,11 +415,16 @@ async def sync_status():
 # ---- Media ----
 @app.get("/media/low/{photo_id}.jpg")
 async def media_low(photo_id:str=Path(...)):
-    p=DATA_DIR/"low"/f"{photo_id}.jpg"; if not p.exists(): raise HTTPException(404); return FileResponse(str(p), media_type="image/jpeg")
+    p = DATA_DIR / "low" / f"{photo_id}.jpg"
+    if not p.exists():
+        raise HTTPException(404)
+    return FileResponse(str(p), media_type="image/jpeg")
 @app.get("/media/hi/{photo_id}.jpg")
 async def media_hi(photo_id:str=Path(...)):
-    p=DATA_DIR/"hi"/f"{photo_id}.jpg"; if not p.exists(): raise HTTPException(404); return FileResponse(str(p), media_type="image/jpeg")
-
+    p = DATA_DIR / "hi" / f"{photo_id}.jpg"
+    if not p.exists():
+        raise HTTPException(404)
+    return FileResponse(str(p), media_type="image/jpeg")
 # ---- Metrics ----
 @app.get("/api/metrics")
 async def api_metrics():
@@ -446,3 +451,72 @@ async def index(): return FileResponse(str(STATIC_DIR/'index.html'))
 @app.get("/qa/fd/{damper_id}", response_class=HTMLResponse)
 @app.get("/admin", response_class=HTMLResponse)
 def spa_routes(room_id:Optional[str]=None, damper_id:Optional[str]=None): return FileResponse(str(STATIC_DIR/'index.html'))
+
+# --- ensure room_config table (separate startup hook to avoid locks) ---
+@app.on_event("startup")
+async def _ensure_room_config_table():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("CREATE TABLE IF NOT EXISTS room_config(room_id TEXT PRIMARY KEY, include_groups TEXT, hide_room INTEGER DEFAULT 0)")
+        await db.commit()
+
+# --- Admin: login (sets signed cookie for 30 min) ---
+@app.post("/api/admin/login")
+async def admin_login(request: Request):
+    body = await request.json()
+    pin = (body or {}).get("pin","")
+    if pin != ADMIN_PIN:
+        raise HTTPException(401, "bad pin")
+    exp = int(time.time()) + 30*60
+    tok = _sign(exp)
+    resp = JSONResponse({"ok": True, "exp": exp})
+    resp.set_cookie("adm", tok, max_age=30*60, path="/", secure=True, httponly=True, samesite="lax")
+    return resp
+
+# --- Admin: get/save per-room checklist groups + hide flag ---
+@app.get("/api/admin/room-config/{room_id}")
+async def get_room_cfg(room_id: str, request: Request):
+    await require_admin(request)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT include_groups, hide_room FROM room_config WHERE room_id=?", (room_id,))
+        row = await cur.fetchone()
+        cur2 = await db.execute("SELECT hidden FROM rooms_cache WHERE id=?", (room_id,))
+        r2 = await cur2.fetchone()
+    include_groups = json.loads(row[0]) if row and row[0] else []
+    hide_room = bool(row[1]) if row else (bool(r2[0]) if r2 else False)
+    return {"includeGroups": include_groups, "hideRoom": hide_room}
+
+@app.post("/api/admin/room-config/{room_id}")
+async def set_room_cfg(room_id: str, request: Request):
+    await require_admin(request)
+    body = await request.json()
+    include = body.get("includeGroups", []) or []
+    hide_room = bool(body.get("hideRoom", False))
+    vis = compute_visible(include)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO room_config(room_id, include_groups, hide_room) VALUES(?,?,?) "
+            "ON CONFLICT(room_id) DO UPDATE SET include_groups=excluded.include_groups, hide_room=excluded.hide_room",
+            (room_id, json.dumps(include), 1 if hide_room else 0)
+        )
+        await db.execute("UPDATE rooms_cache SET hidden=? WHERE id=?", (1 if hide_room else 0, room_id))
+        cur = await db.execute("SELECT id,name FROM items_cache WHERE room_id=?", (room_id,))
+        rows = await cur.fetchall()
+        for iid, name in rows:
+            hidden = 0 if (name in vis or name in NON_REMOVABLE) else 1
+            await db.execute("UPDATE items_cache SET hidden=? WHERE id=?", (hidden, iid))
+        await db.commit()
+    return {"ok": True, **({"redirect": "/"} if hide_room else {})}
+
+# --- Admin: batch hide/unhide rooms from dashboard ---
+@app.post("/api/admin/rooms/hidden-batch")
+async def hidden_batch(request: Request):
+    await require_admin(request)
+    body = await request.json()
+    rooms = body.get("rooms", []) or []
+    async with aiosqlite.connect(DB_PATH) as db:
+        for r in rooms:
+            rid = r.get("id"); hidden = 1 if r.get("hidden") else 0
+            if rid:
+                await db.execute("UPDATE rooms_cache SET hidden=? WHERE id=?", (hidden, rid))
+        await db.commit()
+    return {"ok": True}
