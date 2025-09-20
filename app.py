@@ -280,6 +280,20 @@ async def api_metrics():
             k=floor_id or 'UNK'; floor.setdefault(k,{'rooms':0,'complete':0}); floor[k]['rooms']+=1; floor[k]['complete']+=done
     return {'floors':floor,'time':now_iso()}
 
+# --- Media routes (serve saved photos) ---
+from fastapi import Path
+@app.get("/media/low/{photo_id}.jpg")
+async def media_low(photo_id:str=Path(...)):
+    p = DATA_DIR / "low" / f"{photo_id}.jpg"
+    if not p.exists(): raise HTTPException(status_code=404)
+    return FileResponse(str(p), media_type="image/jpeg")
+
+@app.get("/media/hi/{photo_id}.jpg")
+async def media_hi(photo_id:str=Path(...)):
+    p = DATA_DIR / "hi" / f"{photo_id}.jpg"
+    if not p.exists(): raise HTTPException(status_code=404)
+    return FileResponse(str(p), media_type="image/jpeg")
+
 # --- SPA routes ---
 @app.get('/', response_class=HTMLResponse)
 async def index(): return FileResponse(str(STATIC_DIR/'index.html'))
@@ -287,3 +301,4 @@ async def index(): return FileResponse(str(STATIC_DIR/'index.html'))
 @app.get('/qa/fd/{damper_id}', response_class=HTMLResponse)
 @app.get('/admin', response_class=HTMLResponse)
 def spa_routes(room_id:Optional[str]=None, damper_id:Optional[str]=None): return FileResponse(str(STATIC_DIR/'index.html'))
+ 

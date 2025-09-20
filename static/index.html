@@ -10,8 +10,8 @@
 <section id="dashboard" class="screen active">
   <div class="search-row"><input id="search" type="search" placeholder="Search rooms (e.g. N-0.123)" autocomplete="off"/><button id="adminBtn" class="btn">Admin</button></div>
   <div class="rings">
-    <div class="ring" id="ring-ground"><div class="ring-label">NB – Ground Floor</div><div class="ring-val" id="ring-ground-val">0%</div></div>
-    <div class="ring" id="ring-level1"><div class="ring-label">NB – Level 1</div><div class="ring-val" id="ring-level1-val">0%</div></div>
+    <div class="ring" id="ring-ground"><div class="ring-slice"></div><div class="ring-center"></div><div class="ring-val" id="ring-ground-val">0%</div><div class="ring-label">NB – Ground Floor</div></div>
+    <div class="ring" id="ring-level1"><div class="ring-slice"></div><div class="ring-center"></div><div class="ring-val" id="ring-level1-val">0%</div><div class="ring-label">NB – Level 1</div></div>
   </div>
   <div class="mini-tiles">
     <div class="mini" data-id="AN6.001"><div class="placeholder">No tiles yet</div></div>
@@ -19,6 +19,7 @@
   </div>
   <div id="roomsWrap"><div class="placeholder">No rooms yet – connect Graph or place rooms.json</div></div>
 </section>
+
 <section id="room" class="screen">
   <div class="toolbar"><button class="btn back" data-nav="dashboard">&larr; Back</button><div class="room-title" id="roomTitle"></div><button id="pinBtn" class="btn">Admin PIN</button></div>
   <div class="drawers">
@@ -32,11 +33,28 @@
   </div>
   <div id="checklist"></div>
 </section>
+
 <section id="adminPanel" class="screen">
   <div class="toolbar"><button class="btn back" data-nav="dashboard">&larr; Back</button><div class="room-title">Admin</div></div>
   <div class="admin-content"><h3>Hidden Rooms</h3><div id="hiddenRooms"></div><button id="adminSaveHidden" class="btn primary">Save</button></div>
 </section>
 </main>
+
+<!-- Lightbox -->
+<div id="lightbox" class="lightbox" hidden><div class="lightbox-inner"><img id="lightboxImg" alt="photo"><button id="lightboxClose" class="btn close">×</button></div></div>
+
+<!-- Camera modal -->
+<div id="camModal" class="cam-modal" hidden>
+  <div class="cam-inner">
+    <video id="camVideo" autoplay playsinline></video>
+    <div class="cam-controls">
+      <button id="camShutter" class="btn primary">●</button>
+      <button id="camDone" class="btn">Done</button>
+      <div id="camCount" class="chip">0/10</div>
+    </div>
+  </div>
+</div>
+
 <script src="/static/viewer.js" defer></script>
 <script src="/static/app.js" defer></script>
 </body></html>
