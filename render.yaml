@@ -1,0 +1,7 @@
+services:
+- type: web
+  name: duct-tracker
+  env: docker
+  plan: starter
+  healthCheckPath: /healthz
+  autoDeploy: true

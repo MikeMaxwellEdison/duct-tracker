@@ -1,0 +1,7 @@
+{
+  "name":"duct-tracker",
+  "private": true,
+  "type": "module",
+  "scripts": { "build": "node ./esbuild.config.mjs" },
+  "devDependencies": { "esbuild": "0.23.1" }
+}

@@ -1,0 +1,37 @@
+<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b3d91">
+<link rel="manifest" href="/static/manifest.webmanifest">
+<link rel="stylesheet" href="/static/app.css">
+<title>1M - Manakau Health Park - [Mechanical Duct Install Tracking]</title>
+</head><body>
+<header class="topbar"><h1>1M - Manakau Health Park - [Mechanical Duct Install Tracking]</h1><div id="syncChip" class="chip">Sync: idle</div></header>
+<main id="app">
+<section id="dashboard" class="screen active">
+  <div class="search-row"><input id="search" type="search" placeholder="Search rooms (e.g. N-0.123)" autocomplete="off"/><button id="adminBtn" class="btn">Admin</button></div>
+  <div class="rings"><div class="ring" id="ring-ground"><div class="ring-label">NB â€“ Ground Floor</div><div class="ring-val" id="ring-ground-val">â€“%</div></div>
+  <div class="ring" id="ring-level1"><div class="ring-label">NB â€“ Level 1</div><div class="ring-val" id="ring-level1-val">â€“%</div></div></div>
+  <div class="mini-tiles"><div class="mini" data-id="AN6.001"><div class="placeholder">No tiles yet</div></div>
+  <div class="mini" data-id="AN6.002"><div class="placeholder">No tiles yet</div></div></div>
+  <div id="roomsWrap"><div class="placeholder">No rooms yet â€“ connect Graph or place rooms.json</div></div>
+</section>
+<section id="room" class="screen">
+  <div class="toolbar"><button class="btn back" data-nav="dashboard">&larr; Back</button><div class="room-title" id="roomTitle"></div><button id="pinBtn" class="btn">Admin PIN</button></div>
+  <div class="drawers">
+    <div class="drawer"><div class="drawer-h">Open Drawings</div><div class="drawer-c">
+      <label><input type="checkbox" class="dg" data-kind="RCP"/> RCP</label>
+      <label><input type="checkbox" class="dg" data-kind="RLS"/> RLS</label>
+      <label><input type="checkbox" class="dg" data-kind="1M"/> 1M</label>
+      <div class="viewer-hint">Double Tap to open Room Checklist</div><div id="viewer" class="viewer"></div>
+    </div></div>
+    <div class="drawer"><div class="drawer-h">Fire Rated</div><div class="drawer-c"><div id="fr-viewer" class="viewer small"></div><div class="toast small" id="fr-toast" hidden>Room Location Not Found</div></div></div>
+  </div>
+  <div id="checklist"></div>
+</section>
+<section id="adminPanel" class="screen">
+  <div class="toolbar"><button class="btn back" data-nav="dashboard">&larr; Back</button><div class="room-title">Admin</div></div>
+  <div class="admin-content"><h3>Hidden Rooms</h3><div id="hiddenRooms"></div><button id="adminSaveHidden" class="btn primary">Save</button></div>
+</section>
+</main>
+<script type="module" src="/static/app.js"></script>
+</body></html>

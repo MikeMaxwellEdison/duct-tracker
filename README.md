@@ -1,0 +1,2 @@
+Deploy on Render (Docker). Set env vars (names only): CLIENT_ID, CLIENT_SECRET, TENANT_ID, USER_UPN, DRIVE_ID, EXCEL_PATH, EXCEL_SHEET, PYTHON_VERSION=3.11.9, ROOMS_BASE, RUN_MODE=RENDER.
+After deploy, test: /healthz and /api/rooms. Tiles/indices optional; placeholders show until present.
