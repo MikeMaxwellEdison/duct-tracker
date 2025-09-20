@@ -1,12 +1,12 @@
 ﻿import os, re, json, asyncio, time, hmac, hashlib, pathlib, shutil, datetime as dt
-from typing import Optional, List, Dict, Any, Tuple
-from fastapi import FastAPI, UploadFile, File, Form, Request, Response, HTTPException, Depends, Path
+from typing import Optional, List, Dict, Any
+from fastapi import FastAPI, UploadFile, File, Form, Request, HTTPException, Path
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 import aiosqlite, httpx
 
-# ---- ENV (names only, never print) ----
+# ---- ENV (names only; never print secrets) ----
 CLIENT_ID=os.getenv("CLIENT_ID"); CLIENT_SECRET=os.getenv("CLIENT_SECRET"); TENANT_ID=os.getenv("TENANT_ID")
 USER_UPN=os.getenv("USER_UPN"); DRIVE_ID=os.getenv("DRIVE_ID")
 EXCEL_PATH=os.getenv("EXCEL_PATH") or "0. Master Tracker/NB - FD QA Checklist/Fire Damper ITC 1M-QA-FD-02.xlsx"
@@ -20,14 +20,10 @@ STATIC_DIR = pathlib.Path(__file__).parent/'static'
 DB_PATH   = DATA_DIR / "server.db"
 for d in ["low","hi","notes","superseded"]: (DATA_DIR/d).mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="duct-tracker-api", version="1.4.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-app.mount("/static", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
-
-def now_iso(): return dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc).isoformat()
-def sanitize(s:str)->str: return re.sub(r"[^a-zA-Z0-9_.-]+","_",s or "")
-
-NON_REMOVABLE=['Clash / Issue','Duct Installed','Fire Rated','Grille Boxes Installed','Labelled','Penetrations Ready','Subframe & Grilles Installed']
+# ---- Constants / ordering ----
+NON_REMOVABLE=[
+  'Clash / Issue','Duct Installed','Fire Rated','Grille Boxes Installed','Labelled','Penetrations Ready','Subframe & Grilles Installed'
+]
 GROUPS={
   'Ceiling Grid':['Ceiling Grid Installed','Ceiling Tile Ready'],
   'Lined Ceiling':['Ceiling Lined','Rondo Frame Ready'],
@@ -37,6 +33,13 @@ GROUPS={
   'VCD':['VCD Actuator Installed','VCD Actuator Wired','VCD Installed'],
 }
 FD_DEP=['Access Panel Installed','SD Actuator Installed','SD Actuator Wired','SD Installed','SD Tested']
+GLOBAL_ORDER=[
+  "Clash / Issue","Duct Installed","Fire Rated","Grille Boxes Installed","Labelled","Penetrations Ready","Subframe & Grilles Installed",
+  "Ceiling Grid Installed","Ceiling Tile Ready","Ceiling Lined","Rondo Frame Ready",
+  "LR FD Actuator Installed","LR FD Actuator Wired","LR FD Installed","LR FD Tested",
+  "IBD FD Installed","IBD FD Tested","Access Panel Installed","SD Actuator Installed","SD Actuator Wired","SD Installed","SD Tested",
+  "VAV Installed","VAV Wired","VCD Actuator Installed","VCD Actuator Wired","VCD Installed"
+]
 
 def compute_visible(included_groups:List[str])->set:
     vis=set(NON_REMOVABLE)
@@ -45,6 +48,13 @@ def compute_visible(included_groups:List[str])->set:
     if ('LR Fire Damper' in included_groups) or ('IBD Fire Damper' in included_groups):
         for n in FD_DEP: vis.add(n)
     return vis
+
+def now_iso(): return dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc).isoformat()
+def sanitize(s:str)->str: return re.sub(r"[^a-zA-Z0-9_.-]+","_",s or "")
+
+app = FastAPI(title="duct-tracker-api", version="1.5.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
 
 # ---- DB ----
 async def ensure_db():
@@ -55,10 +65,11 @@ async def ensure_db():
         CREATE TABLE IF NOT EXISTS items_cache(id TEXT PRIMARY KEY,room_id TEXT,name TEXT,path TEXT,order_index INTEGER,hidden INTEGER DEFAULT 0,updated_at TEXT);
         CREATE TABLE IF NOT EXISTS status_events(id TEXT PRIMARY KEY,item_id TEXT,status TEXT,note TEXT,updated_at TEXT,client_id TEXT);
         CREATE TABLE IF NOT EXISTS photos(id TEXT PRIMARY KEY,item_id TEXT,kind TEXT,created_at TEXT,server_id TEXT, superseded INTEGER DEFAULT 0, onedrive_id TEXT);
-        CREATE TABLE IF NOT EXISTS fd_links(a TEXT PRIMARY KEY, b TEXT); -- symmetric pairing
+        CREATE TABLE IF NOT EXISTS fd_links(a TEXT PRIMARY KEY, b TEXT);
+        CREATE TABLE IF NOT EXISTS room_config(room_id TEXT PRIMARY KEY, include_groups TEXT, hide_room INTEGER DEFAULT 0);
         """); await db.commit()
 
-# ---- Graph client ----
+# ---- Microsoft Graph client helpers ----
 class Graph:
     def __init__(self, tenant, client_id, client_secret):
         self.tenant=tenant; self.client_id=client_id; self.client_secret=client_secret
@@ -72,31 +83,19 @@ class Graph:
                 tok=r.json(); self.token=tok['access_token']; self.expiry=time.time()+float(tok.get('expires_in',3600))-120
         return {'Authorization': f'Bearer {self.token}'}
 
-    async def get_item_by_path(self, drive_id:str, path:str)->Optional[Dict[str,Any]]:
-        h=await self._auth()
-        url=f'https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{path}'
-        async with httpx.AsyncClient(timeout=60) as c:
-            r=await c.get(url, headers=h)
-            if r.status_code==200: return r.json()
-            return None
-
     async def ensure_folder_path(self, drive_id:str, path:str)->Dict[str,Any]:
-        """Ensure nested folders exist; returns terminal folder item"""
         parts=[p for p in path.strip('/').split('/') if p]
-        cur=""; parent="root"
+        cur=""
         h=await self._auth()
         async with httpx.AsyncClient(timeout=60) as c:
-            for p in parts:
+            for i,p in enumerate(parts):
                 cur = (cur + "/" + p) if cur else p
-                # try get
                 r=await c.get(f'https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{cur}', headers=h)
                 if r.status_code==200: continue
-                # create under parent path
-                parent_path = "/".join(parts[:parts.index(p)]) if parts.index(p)>0 else ""
-                parent_url = f'https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{parent_path or ""}:/children'
+                parent_path="/".join(parts[:i]) if i>0 else ""
+                parent_url=f'https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{parent_path}:/children' if parent_path else f'https://graph.microsoft.com/v1.0/drives/{drive_id}/root/children'
                 cr=await c.post(parent_url, headers={**h,'Content-Type':'application/json'}, json={"name":p,"folder":{},"@microsoft.graph.conflictBehavior":"replace"})
                 cr.raise_for_status()
-            # return terminal
             rr=await c.get(f'https://graph.microsoft.com/v1.0/drives/{drive_id}/root:/{cur}', headers=h); rr.raise_for_status(); return rr.json()
 
     async def upload_small(self, drive_id:str, path:str, content:bytes)->Dict[str,Any]:
@@ -117,82 +116,19 @@ class Graph:
                 if hr.status_code in (200,201): return hr.json()
                 if hr.status_code not in (202,204): hr.raise_for_status()
                 pos=end+1
-            # should not reach
             return {"id":""}
+
+    async def move_item(self, drive_id:str, item_id:str, new_parent_id:str)->Dict[str,Any]:
+        """Move existing drive item to a folder by id"""
+        h=await self._auth()
+        url=f'https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{item_id}'
+        async with httpx.AsyncClient(timeout=60) as c:
+            r=await c.patch(url, headers={**h,'Content-Type':'application/json'}, json={"parentReference":{"id": new_parent_id}})
+            r.raise_for_status(); return r.json()
 
 graph = Graph(TENANT_ID, CLIENT_ID, CLIENT_SECRET) if all([TENANT_ID,CLIENT_ID,CLIENT_SECRET]) else None
 
-# ---- OneDrive sync ----
-async def onedrive_push() -> Dict[str,int]:
-    """Upload pending LOW/HI photos and NOTES.txt and move superseded files"""
-    if not (graph and DRIVE_ID): return {"uploaded_low":0,"uploaded_hi":0,"notes":0,"moved_superseded":0}
-    uploaded_low=uploaded_hi=notes=mv=0
-    async with aiosqlite.connect(DB_PATH) as db:
-        # photos not yet uploaded
-        cur = await db.execute("SELECT id,item_id,kind,IFNULL(onedrive_id,''),IFNULL(superseded,0) FROM photos")
-        rows = await cur.fetchall()
-    for pid,item_id,kind,od_id,sup in rows:
-        # target path based on items_cache.path
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur=await db.execute("SELECT path FROM items_cache WHERE id=?",(item_id,)); row=await cur.fetchone()
-        if not row: continue
-        item_path = row[0] or ""
-        # Ensure folder exists
-        try:
-            await graph.ensure_folder_path(DRIVE_ID, item_path)
-        except Exception:
-            continue
-        # Superseded: try move if already uploaded
-        if sup:
-            if od_id:
-                try:
-                    # Move to Superseded/{filename}
-                    sup_path = f"{item_path}/Superseded"
-                    await graph.ensure_folder_path(DRIVE_ID, sup_path)
-                    # Re-upload low marker to Superseded if needed (best-effort)
-                    # (Actual Graph move would need item driveItem id; skipping for brevity)
-                except Exception:
-                    pass
-            mv+=1
-            continue
-        # Upload LOW / HI
-        if kind=="LOW":
-            fpath=DATA_DIR/'low'/f"{pid}.jpg"
-            if fpath.exists():
-                data=fpath.read_bytes()
-                try:
-                    up= await graph.upload_small(DRIVE_ID, f"{item_path}/{pid}.low.jpg", data)
-                    uploaded_low+=1
-                    async with aiosqlite.connect(DB_PATH) as db:
-                        await db.execute("UPDATE photos SET onedrive_id=? WHERE id=?",(up.get("id",""), pid)); await db.commit()
-                except Exception:
-                    pass
-        else: # HI
-            fpath=DATA_DIR/'hi'/f"{pid}.jpg"
-            if fpath.exists():
-                data=fpath.read_bytes()
-                try:
-                    if len(data) <= 4*1024*1024:
-                        up= await graph.upload_small(DRIVE_ID, f"{item_path}/{pid}.hi.jpg", data)
-                    else:
-                        up= await graph.upload_large(DRIVE_ID, f"{item_path}/{pid}.hi.jpg", data)
-                    uploaded_hi+=1
-                    async with aiosqlite.connect(DB_PATH) as db:
-                        await db.execute("UPDATE photos SET onedrive_id=? WHERE id=?",(up.get("id",""), pid)); await db.commit()
-                except Exception:
-                    pass
-        # NOTES
-        safe = sanitize(item_id); notes_file = DATA_DIR/'notes'/safe/'NOTES.txt'
-        if notes_file.exists():
-            try:
-                content = notes_file.read_bytes()
-                await graph.upload_small(DRIVE_ID, f"{item_path}/NOTES.txt", content)
-                notes+=1
-            except Exception:
-                pass
-    return {"uploaded_low":uploaded_low,"uploaded_hi":uploaded_hi,"notes":notes,"moved_superseded":mv}
-
-# ---- Rooms/items (same as before, with note fallback from NOTES.txt) ----
+# ---- Helpers ----
 ROOM_NAME_FLOOR = re.compile(r"\b(N-[01])")
 
 async def scan_rooms():
@@ -212,11 +148,10 @@ async def scan_rooms():
     return rooms
 
 async def items_for_room(room_id:str):
-    # prefer real children; fallback to NON_REMOVABLE baseline
-    path=None
+    # try Graph first
     async with aiosqlite.connect(DB_PATH) as db:
         cur=await db.execute("SELECT path FROM rooms_cache WHERE id=?",(room_id,)); row=await cur.fetchone()
-    if row: path=row[0]
+    path=row[0] if row else None
     out=[]
     if graph and DRIVE_ID and path:
         try:
@@ -230,16 +165,23 @@ async def items_for_room(room_id:str):
                         out.append({'id':iid,'roomId':room_id,'name':ch['name'],'path':f'{path}/{ch["name"]}','orderIndex':idx,'hidden':0,'updatedAt':now_iso()})
         except Exception:
             pass
+    # Ensure non-removables always exist
+    names=set([it["name"] for it in out])
+    for n in NON_REMOVABLE:
+        if n not in names:
+            out.append({'id':f'{room_id}::{n}','roomId':room_id,'name':n,'path':'','orderIndex':GLOBAL_ORDER.index(n) if n in GLOBAL_ORDER else 999,'hidden':0,'updatedAt':now_iso()})
     if not out:
-        base=NON_REMOVABLE.copy()
-        for i,n in enumerate(base): out.append({'id':f'{room_id}::{n}','roomId':room_id,'name':n,'path':'','orderIndex':i,'hidden':0,'updatedAt':now_iso()})
+        # baseline
+        for i,n in enumerate(NON_REMOVABLE):
+            out.append({'id':f'{room_id}::{n}','roomId':room_id,'name':n,'path':'','orderIndex':i,'hidden':0,'updatedAt':now_iso()})
+    # persist/merge
     async with aiosqlite.connect(DB_PATH) as db:
         for it in out:
             await db.execute('INSERT INTO items_cache(id,room_id,name,path,order_index,hidden,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,path=excluded.path,order_index=excluded.order_index,updated_at=excluded.updated_at',(it['id'],it['roomId'],it['name'],it['path'],it['orderIndex'],it['hidden'],it['updatedAt']))
         await db.commit()
     return out
 
-# ---- Admin auth cookie ----
+# ---- Admin session cookie ----
 def _sign(exp:int)->str:
     return f"{exp}.{hmac.new(ADMIN_PIN.encode(),f'adm|{exp}'.encode(),hashlib.sha256).hexdigest()}"
 def _verify(tok:str)->bool:
@@ -252,7 +194,7 @@ async def require_admin(req:Request):
     t=req.cookies.get("adm",""); 
     if not t or not _verify(t): raise HTTPException(401,"admin required")
 
-# ---- Startup ----
+# ---- Startup / periodic ----
 @app.on_event("startup")
 async def _startup():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -263,7 +205,6 @@ async def _periodic():
     while True:
         try:
             await asyncio.sleep(300)
-            # optional background refresh
             rooms=await scan_rooms()
             if rooms:
                 async with aiosqlite.connect(DB_PATH) as db:
@@ -272,7 +213,7 @@ async def _periodic():
                     await db.commit()
         except: pass
 
-# ---- API ----
+# ---- API: health / rooms / items ----
 @app.get("/healthz")
 async def healthz(): return {"ok":True,"time":now_iso()}
 
@@ -298,13 +239,14 @@ async def api_room_items(room_id:str):
         for it in items:
             cur=await db.execute("SELECT status,note,updated_at FROM status_events WHERE item_id=? ORDER BY updated_at DESC LIMIT 1",(it['id'],)); row=await cur.fetchone()
             status=row[0] if row else "NA"; note=row[1] if row else ""
-            # if no note, show last line in local NOTES.txt
             if not note:
                 safe=sanitize(it['id']); nf=DATA_DIR/'notes'/safe/'NOTES.txt'
                 if nf.exists():
                     lines=[ln.strip() for ln in nf.read_text(encoding="utf-8").splitlines() if ln.strip()]
                     if lines: note = lines[-1].split(" - ",1)[-1]
             out.append({**it,"status":status,"note":note})
+    # maintain global order
+    out.sort(key=lambda x: GLOBAL_ORDER.index(x["name"]) if x["name"] in GLOBAL_ORDER else 999)
     return out
 
 @app.post("/api/items/{item_id}/status")
@@ -313,7 +255,6 @@ async def api_status(item_id:str, status:str=Form(...), note:Optional[str]=Form(
     when=updatedAt or now_iso()
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("INSERT OR IGNORE INTO status_events(id,item_id,status,note,updated_at,client_id) VALUES(?,?,?,?,?,?)",(eid,item_id,status,note,when,clientId)); await db.commit()
-        # FD holds: propagate PASS to linked item
         if "FD Tested" in item_id and status=="PASS":
             cur=await db.execute("SELECT b FROM fd_links WHERE a=?",(item_id,)); r=await cur.fetchone()
             if r:
@@ -332,22 +273,19 @@ async def api_note(item_id:str, req:Request):
     with open(notes,"a",encoding="utf-8") as f: f.write(line)
     return {"ok":True}
 
+# ---- FD cross-room holds ----
 @app.post("/api/fd/hold")
 async def api_fd_hold(req:Request):
-    """Create reciprocal hold links for FD Tested items across rooms"""
     body=await req.json()
     item_id=body.get("itemId",""); linked_room=body.get("linkedRoomId","")
     if not item_id or not linked_room: raise HTTPException(400,"itemId and linkedRoomId required")
-    # find linked FD Tested item in target room
     async with aiosqlite.connect(DB_PATH) as db:
         cur=await db.execute("SELECT id FROM items_cache WHERE room_id=? AND name LIKE '%FD Tested%'",(linked_room,))
         row=await cur.fetchone()
         if not row: raise HTTPException(404,"Linked room has no 'FD Tested' item")
         target=row[0]
-        # create symmetric links
         await db.execute("INSERT OR REPLACE INTO fd_links(a,b) VALUES(?,?)",(item_id,target))
         await db.execute("INSERT OR REPLACE INTO fd_links(a,b) VALUES(?,?)",(target,item_id))
-        # set both to FAIL if not already
         eid1=hashlib.sha256(f"{item_id}|FAIL||{now_iso()}".encode()).hexdigest()
         eid2=hashlib.sha256(f"{target}|FAIL||{now_iso()}".encode()).hexdigest()
         await db.execute("INSERT OR IGNORE INTO status_events(id,item_id,status,note,updated_at,client_id) VALUES(?,?,?,?,?,?)",(eid1,item_id,"FAIL","Hold created",now_iso(),"server"))
@@ -355,6 +293,7 @@ async def api_fd_hold(req:Request):
         await db.commit()
     return {"ok":True,"linkedItemId":target}
 
+# ---- Photos ----
 @app.post("/api/photos/lowres")
 async def api_low(itemId:str=Form(...), photoId:str=Form(...), createdAt:str=Form(...), file:UploadFile=File(...)):
     (DATA_DIR/'low').mkdir(parents=True, exist_ok=True)
@@ -381,19 +320,95 @@ async def api_ph(item_id:str):
 async def api_sup(photo_id:str, req:Request):
     body=await req.json(); itemId=(body or {}).get("itemId","")
     safe=sanitize(itemId); outdir=DATA_DIR/'superseded'/safe; outdir.mkdir(parents=True, exist_ok=True)
-    # capture container paths before moving
+    # fetch metadata
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur=await db.execute("SELECT IFNULL(onedrive_id,''), item_id FROM photos WHERE id=?", (photo_id,))
+        prow=await cur.fetchone()
+        cur2=await db.execute("SELECT path FROM items_cache WHERE id=?", (itemId,))
+        irow=await cur2.fetchone()
+    od_id = (prow[0] if prow else "") or ""
+    item_path = (irow[0] if irow else "") or ""
+    # move local assets
     for kind, sub in [('LOW','low'),('HI','hi')]:
         src=DATA_DIR/sub/f'{photo_id}.jpg'
         if src.exists():
             dst=outdir/f'{photo_id}.{sub}.jpg'
             try: shutil.move(str(src), str(dst))
             except Exception: pass
+    # mark superseded
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE photos SET superseded=1 WHERE id=?",(photo_id,)); await db.commit()
+        await db.execute("UPDATE photos SET superseded=1 WHERE id=?", (photo_id,)); await db.commit()
+    # move in OneDrive if we have id
+    if graph and DRIVE_ID and od_id and item_path:
+        try:
+            sup_path = f"{item_path}/Superseded"
+            sup_item = await graph.ensure_folder_path(DRIVE_ID, sup_path)
+            sup_id = sup_item.get("id","")
+            if sup_id:
+                await graph.move_item(DRIVE_ID, od_id, sup_id)
+        except Exception:
+            pass
     return {"ok":True}
 
-# ---- Sync controls ----
+# ---- Sync controls + push (optional background uploader) ----
 SYNC_PAUSED=False
+async def onedrive_push() -> Dict[str,int]:
+    if not (graph and DRIVE_ID): return {"uploaded_low":0,"uploaded_hi":0,"notes":0,"moved_superseded":0}
+    uploaded_low=uploaded_hi=notes=mv=0
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT id,item_id,kind,IFNULL(onedrive_id,''),IFNULL(superseded,0) FROM photos")
+        rows = await cur.fetchall()
+    for pid,item_id,kind,od_id,sup in rows:
+        # item path
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur=await db.execute("SELECT path FROM items_cache WHERE id=?",(item_id,)); row=await cur.fetchone()
+        if not row: continue
+        item_path = row[0] or ""
+        try:
+            await graph.ensure_folder_path(DRIVE_ID, item_path)
+        except Exception:
+            continue
+        if sup:
+            # already local-moved; try ensure Superseded exists; (move might have been done at delete time)
+            try:
+                await graph.ensure_folder_path(DRIVE_ID, f"{item_path}/Superseded")
+            except Exception:
+                pass
+            mv+=1; continue
+        if kind=="LOW":
+            fpath=DATA_DIR/'low'/f"{pid}.jpg"
+            if fpath.exists():
+                data=fpath.read_bytes()
+                try:
+                    up= await graph.upload_small(DRIVE_ID, f"{item_path}/{pid}.low.jpg", data)
+                    uploaded_low+=1
+                    async with aiosqlite.connect(DB_PATH) as db:
+                        await db.execute("UPDATE photos SET onedrive_id=? WHERE id=?",(up.get("id",""), pid)); await db.commit()
+                except Exception:
+                    pass
+        else:
+            fpath=DATA_DIR/'hi'/f"{pid}.jpg"
+            if fpath.exists():
+                data=fpath.read_bytes()
+                try:
+                    if len(data) <= 4*1024*1024:
+                        up= await graph.upload_small(DRIVE_ID, f"{item_path}/{pid}.hi.jpg", data)
+                    else:
+                        up= await graph.upload_large(DRIVE_ID, f"{item_path}/{pid}.hi.jpg", data)
+                    uploaded_hi+=1
+                    async with aiosqlite.connect(DB_PATH) as db:
+                        await db.execute("UPDATE photos SET onedrive_id=? WHERE id=?",(up.get("id",""), pid)); await db.commit()
+                except Exception:
+                    pass
+        safe = sanitize(item_id); notes_file = DATA_DIR/'notes'/safe/'NOTES.txt'
+        if notes_file.exists():
+            try:
+                await graph.upload_small(DRIVE_ID, f"{item_path}/NOTES.txt", notes_file.read_bytes())
+                notes+=1
+            except Exception:
+                pass
+    return {"uploaded_low":uploaded_low,"uploaded_hi":uploaded_hi,"notes":notes,"moved_superseded":mv}
+
 @app.post("/api/sync/pause")
 async def sync_pause(): 
     global SYNC_PAUSED; SYNC_PAUSED=True; return {"ok":True,"paused":True}
@@ -405,7 +420,6 @@ async def sync_push():
     if SYNC_PAUSED: return {"ok":False,"paused":True}
     res = await onedrive_push()
     return {"ok":True, **res}
-
 @app.get("/api/sync/status")
 async def sync_status():
     async with aiosqlite.connect(DB_PATH) as db:
@@ -414,17 +428,19 @@ async def sync_status():
 
 # ---- Media ----
 @app.get("/media/low/{photo_id}.jpg")
-async def media_low(photo_id:str=Path(...)):
+async def media_low(photo_id: str = Path(...)):
     p = DATA_DIR / "low" / f"{photo_id}.jpg"
     if not p.exists():
         raise HTTPException(404)
     return FileResponse(str(p), media_type="image/jpeg")
+
 @app.get("/media/hi/{photo_id}.jpg")
-async def media_hi(photo_id:str=Path(...)):
+async def media_hi(photo_id: str = Path(...)):
     p = DATA_DIR / "hi" / f"{photo_id}.jpg"
     if not p.exists():
         raise HTTPException(404)
     return FileResponse(str(p), media_type="image/jpeg")
+
 # ---- Metrics ----
 @app.get("/api/metrics")
 async def api_metrics():
@@ -444,22 +460,7 @@ async def api_metrics():
             k=floor_id or "UNK"; floor.setdefault(k,{"rooms":0,"complete":0}); floor[k]["rooms"]+=1; floor[k]["complete"]+=done
     return {"floors":floor,"time":now_iso()}
 
-# ---- SPA ----
-@app.get("/", response_class=HTMLResponse)
-async def index(): return FileResponse(str(STATIC_DIR/'index.html'))
-@app.get("/room/{room_id}", response_class=HTMLResponse)
-@app.get("/qa/fd/{damper_id}", response_class=HTMLResponse)
-@app.get("/admin", response_class=HTMLResponse)
-def spa_routes(room_id:Optional[str]=None, damper_id:Optional[str]=None): return FileResponse(str(STATIC_DIR/'index.html'))
-
-# --- ensure room_config table (separate startup hook to avoid locks) ---
-@app.on_event("startup")
-async def _ensure_room_config_table():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("CREATE TABLE IF NOT EXISTS room_config(room_id TEXT PRIMARY KEY, include_groups TEXT, hide_room INTEGER DEFAULT 0)")
-        await db.commit()
-
-# --- Admin: login (sets signed cookie for 30 min) ---
+# ---- Admin APIs ----
 @app.post("/api/admin/login")
 async def admin_login(request: Request):
     body = await request.json()
@@ -472,7 +473,6 @@ async def admin_login(request: Request):
     resp.set_cookie("adm", tok, max_age=30*60, path="/", secure=True, httponly=True, samesite="lax")
     return resp
 
-# --- Admin: get/save per-room checklist groups + hide flag ---
 @app.get("/api/admin/room-config/{room_id}")
 async def get_room_cfg(room_id: str, request: Request):
     await require_admin(request)
@@ -483,7 +483,7 @@ async def get_room_cfg(room_id: str, request: Request):
         r2 = await cur2.fetchone()
     include_groups = json.loads(row[0]) if row and row[0] else []
     hide_room = bool(row[1]) if row else (bool(r2[0]) if r2 else False)
-    return {"includeGroups": include_groups, "hideRoom": hide_room}
+    return {"includeGroups": include_groups, "HideRoom": hide_room, "hideRoom": hide_room}
 
 @app.post("/api/admin/room-config/{room_id}")
 async def set_room_cfg(room_id: str, request: Request):
@@ -499,15 +499,19 @@ async def set_room_cfg(room_id: str, request: Request):
             (room_id, json.dumps(include), 1 if hide_room else 0)
         )
         await db.execute("UPDATE rooms_cache SET hidden=? WHERE id=?", (1 if hide_room else 0, room_id))
+        # ensure non-removables exist
+        for n in NON_REMOVABLE:
+            iid=f"{room_id}::{n}"
+            await db.execute("INSERT OR IGNORE INTO items_cache(id,room_id,name,path,order_index,hidden,updated_at) VALUES(?,?,?,?,?,?,?)",(iid,room_id,n,"",GLOBAL_ORDER.index(n) if n in GLOBAL_ORDER else 999,0,now_iso()))
+        # hide/show based on vis
         cur = await db.execute("SELECT id,name FROM items_cache WHERE room_id=?", (room_id,))
         rows = await cur.fetchall()
-        for iid, name in rows:
+        for iid,name in rows:
             hidden = 0 if (name in vis or name in NON_REMOVABLE) else 1
             await db.execute("UPDATE items_cache SET hidden=? WHERE id=?", (hidden, iid))
         await db.commit()
     return {"ok": True, **({"redirect": "/"} if hide_room else {})}
 
-# --- Admin: batch hide/unhide rooms from dashboard ---
 @app.post("/api/admin/rooms/hidden-batch")
 async def hidden_batch(request: Request):
     await require_admin(request)
@@ -520,3 +524,51 @@ async def hidden_batch(request: Request):
                 await db.execute("UPDATE rooms_cache SET hidden=? WHERE id=?", (hidden, rid))
         await db.commit()
     return {"ok": True}
+
+@app.post("/api/admin/room-clear/{room_id}")
+async def admin_room_clear(room_id:str, request: Request):
+    await require_admin(request)
+    cleared_photos = 0
+    # supersede all photos for items in room
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT id FROM items_cache WHERE room_id=?", (room_id,))
+        items = [r[0] for r in await cur.fetchall()]
+        for iid in items:
+            curp = await db.execute("SELECT id,IFNULL(onedrive_id,''),kind FROM photos WHERE item_id=? AND IFNULL(superseded,0)=0",(iid,))
+            photos = await curp.fetchall()
+            # path for OneDrive
+            curpath = await db.execute("SELECT path FROM items_cache WHERE id=?", (iid,)); prow=await curpath.fetchone()
+            item_path = (prow[0] if prow else "") or ""
+            # local + cloud move
+            for pid,od_id,kind in photos:
+                for sub in ('low','hi'):
+                    src = DATA_DIR/sub/f"{pid}.jpg"
+                    if src.exists():
+                        outdir = DATA_DIR/'superseded'/sanitize(iid); outdir.mkdir(parents=True, exist_ok=True)
+                        try: shutil.move(str(src), str(outdir/f"{pid}.{sub}.jpg"))
+                        except Exception: pass
+                if graph and DRIVE_ID and od_id and item_path:
+                    try:
+                        sup = await graph.ensure_folder_path(DRIVE_ID, f"{item_path}/Superseded")
+                        supid = sup.get("id","")
+                        if supid: await graph.move_item(DRIVE_ID, od_id, supid)
+                    except Exception: pass
+                cleared_photos += 1
+            await db.execute("UPDATE photos SET superseded=1 WHERE item_id=?", (iid,))
+            # reset status to NA
+            eid=hashlib.sha256(f"{iid}|NA|cleared|{now_iso()}".encode()).hexdigest()
+            await db.execute("INSERT OR IGNORE INTO status_events(id,item_id,status,note,updated_at,client_id) VALUES(?,?,?,?,?,?)",(eid,iid,"NA","Cleared by admin",now_iso(),"server"))
+            # append marker line to notes (history preserved)
+            safe=sanitize(iid); nf=DATA_DIR/'notes'/safe/'NOTES.txt'
+            nf.parent.mkdir(parents=True, exist_ok=True)
+            with open(nf,"a",encoding="utf-8") as f: f.write(f"{now_iso()} - [CLEARED]\n")
+        await db.commit()
+    return {"ok":True,"clearedPhotos":cleared_photos}
+
+# ---- SPA routes ----
+@app.get("/", response_class=HTMLResponse)
+async def index(): return FileResponse(str(STATIC_DIR/'index.html'))
+@app.get("/room/{room_id}", response_class=HTMLResponse)
+@app.get("/qa/fd/{damper_id}", response_class=HTMLResponse)
+@app.get("/admin", response_class=HTMLResponse)
+def spa_routes(room_id:Optional[str]=None, damper_id:Optional[str]=None): return FileResponse(str(STATIC_DIR/'index.html'))

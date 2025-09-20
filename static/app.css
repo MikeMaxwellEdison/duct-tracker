@@ -3,8 +3,7 @@ html,body{margin:0;padding:0;background:#0b1320;color:#e8eef9;font-family:system
 .topbar{position:sticky;top:0;background:#0b1f3a;border-bottom:1px solid #173257;padding:10px 12px;z-index:3;display:flex;align-items:center;justify-content:space-between;gap:8px}
 h1{font-size:16px;margin:0}
 main{padding:12px}
-.screen{display:none}
-.screen.active{display:block}
+.screen{display:none}.screen.active{display:block}
 .search-row{display:flex;gap:8px;margin-bottom:12px}
 .search-row input{flex:1;padding:10px 12px;border-radius:8px;border:1px solid #173257;background:#0e1c33;color:#e8eef9}
 .btn{background:#173257;color:#e8eef9;border:1px solid #20406b;border-radius:10px;padding:10px 12px}
@@ -25,7 +24,7 @@ main{padding:12px}
 .placeholder{padding:16px;border:1px dashed #2a4f85;border-radius:10px;color:#9fb3d1;text-align:center}
 .toolbar{margin-bottom:8px}
 .grid3{display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:8px}
-.room-title{text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.room-title{text-align:center;white-space:normal;word-break:break-word;line-height:1.2}
 .viewer{height:220px;background:#0c1526;border:1px solid #183258;border-radius:10px}
 .viewer.small{height:140px}
 .toast.small{font-size:12px;background:#1d3459;padding:6px 10px;border-radius:8px;border:1px solid #2b518b}
@@ -39,9 +38,10 @@ main{padding:12px}
 .lightbox[hidden]{display:none}
 .lightbox-inner{position:relative;max-width:95vw;max-height:85vh}
 .lightbox img{max-width:95vw;max-height:85vh;border-radius:10px;border:1px solid #2a4f85}
-.btn.close{position:absolute;top:8px;right:8px;border-radius:50%;width:40px;height:40px}
-.btn.close.left{left:8px;right:auto}
-.btn.close.right{right:8px}
+.btn.close{position:absolute;top:8px;border-radius:50%;width:40px;height:40px}
+.btn.close.left{left:8px}
+.btn.close.right{left:56px;right:auto} /* place NEXT beside PREV at top-left */
+.btn.close{background:#173257}
 .btn.del{position:absolute;left:8px;bottom:8px}
 .cam-modal{position:fixed;inset:0;background:#000c;display:flex;align-items:center;justify-content:center;z-index:60}
 .cam-modal[hidden]{display:none}
