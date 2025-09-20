@@ -190,3 +190,4 @@ async def index(): return FileResponse(str(STATIC_DIR/'index.html'))
 @app.get('/qa/fd/{damper_id}', response_class=HTMLResponse)
 @app.get('/admin', response_class=HTMLResponse)
 def spa_routes(room_id:Optional[str]=None, damper_id:Optional[str]=None): return FileResponse(str(STATIC_DIR/'index.html'))
+
