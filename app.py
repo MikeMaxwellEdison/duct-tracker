@@ -1,4 +1,4 @@
-import os, re, json, asyncio, time, hashlib, pathlib, datetime as dt
+﻿import os, re, json, asyncio, time, hashlib, pathlib, datetime as dt
 from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
@@ -13,7 +13,8 @@ EXCEL_SHEET=os.getenv('EXCEL_SHEET') or 'ITC'
 ROOMS_BASE=os.getenv('ROOMS_BASE') or '0. Master Tracker/Online Folders'
 RUN_MODE=os.getenv('RUN_MODE') or 'RENDER'
 
-DATA_DIR = pathlib.Path('/app/data'); DB_PATH = DATA_DIR/'server.db'
+DATA_DIR = pathlib.Path(os.getenv("DATA_DIR", str(pathlib.Path(__file__).parent / "data")))
+DB_PATH = DATA_DIR / "server.db"
 STATIC_DIR = pathlib.Path(__file__).parent/'static'
 
 app = FastAPI(title='duct-tracker-api', version='1.0.2')
