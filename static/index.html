@@ -22,6 +22,9 @@
 
 <section id="room" class="screen">
   <div class="toolbar"><button class="btn back" data-nav="dashboard">&larr; Back</button><div class="room-title" id="roomTitle"></div><button id="pinBtn" class="btn">Admin PIN</button></div>
+
+  <!-- Admin config will be injected here ABOVE Open Drawings -->
+
   <div class="drawers">
     <div class="drawer"><div class="drawer-h">Open Drawings</div><div class="drawer-c">
       <label><input type="checkbox" class="dg" data-kind="RCP"/> RCP</label>
@@ -31,6 +34,7 @@
     </div></div>
     <div class="drawer"><div class="drawer-h">Fire Rated</div><div class="drawer-c"><div id="fr-viewer" class="viewer small"></div><div class="toast small" id="fr-toast" hidden>Room Location Not Found</div></div></div>
   </div>
+
   <div id="checklist"></div>
 </section>
 
@@ -41,14 +45,25 @@
 </main>
 
 <!-- Lightbox -->
-<div id="lightbox" class="lightbox" hidden><div class="lightbox-inner"><img id="lightboxImg" alt="photo"><button id="lightboxClose" class="btn close">×</button></div></div>
+<div id="lightbox" class="lightbox" hidden>
+  <div class="lightbox-inner">
+    <button id="lbPrev" class="btn close" style="left:8px;right:auto">‹</button>
+    <img id="lightboxImg" alt="photo">
+    <button id="lbNext" class="btn close">›</button>
+    <button id="lightboxDelete" class="btn" style="position:absolute;left:8px;bottom:8px">Delete</button>
+    <button id="lightboxClose" class="btn close">×</button>
+  </div>
+</div>
 
 <!-- Camera modal -->
 <div id="camModal" class="cam-modal" hidden>
   <div class="cam-inner">
+    <div class="chip" id="camItemName">Item</div>
     <video id="camVideo" autoplay playsinline></video>
     <div class="cam-controls">
-      <button id="camShutter" class="btn primary">●</button>
+      <button id="camPrev" class="btn">◀ Prev</button>
+      <button id="camShutter" class="btn primary" style="width:64px;height:64px;border-radius:50%">●</button>
+      <button id="camNext" class="btn">Next ▶</button>
       <button id="camDone" class="btn">Done</button>
       <div id="camCount" class="chip">0/10</div>
     </div>

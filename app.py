@@ -1,6 +1,6 @@
-﻿import os, re, json, asyncio, time, hmac, hashlib, pathlib, datetime as dt
+﻿import os, re, json, asyncio, time, hmac, hashlib, pathlib, shutil, datetime as dt
 from typing import Optional, List, Dict, Any
-from fastapi import FastAPI, UploadFile, File, Form, Request, Response, HTTPException, Depends
+from fastapi import FastAPI, UploadFile, File, Form, Request, Response, HTTPException, Depends, Path
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,21 +13,25 @@ EXCEL_PATH=os.getenv('EXCEL_PATH') or '0. Master Tracker/NB - FD QA Checklist/Fi
 EXCEL_SHEET=os.getenv('EXCEL_SHEET') or 'ITC'
 ROOMS_BASE=os.getenv('ROOMS_BASE') or '0. Master Tracker/Online Folders'
 RUN_MODE=os.getenv('RUN_MODE') or 'RENDER'
-ADMIN_PIN=os.getenv('ADMIN_PIN','devpin')  # set in Render; dev default still works across workers
+ADMIN_PIN=os.getenv('ADMIN_PIN','devpin')  # set in Render
 
 # --- Paths (runtime-safe) ---
 DATA_DIR = pathlib.Path(os.getenv("DATA_DIR", str(pathlib.Path(__file__).parent / "data")))
 DB_PATH = DATA_DIR / "server.db"
 STATIC_DIR = pathlib.Path(__file__).parent/'static'
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+(DATA_DIR / "low").mkdir(parents=True, exist_ok=True)
+(DATA_DIR / "hi").mkdir(parents=True, exist_ok=True)
+(DATA_DIR / "notes").mkdir(parents=True, exist_ok=True)
+(DATA_DIR / "superseded").mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title='duct-tracker-api', version='1.1.0')
+app = FastAPI(title='duct-tracker-api', version='1.2.0')
 app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_methods=['*'], allow_headers=['*'])
 app.mount('/static', StaticFiles(directory=str(STATIC_DIR), html=True), name='static')
 
 def now_iso(): return dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc).isoformat()
+def sanitize(s:str)->str: return re.sub(r'[^a-zA-Z0-9_.-]+','_',s or '')
 
-# --- Server-side checklist taxonomy (mirrors frontend) ---
+# --- Taxonomy ---
 NON_REMOVABLE=['Clash / Issue','Duct Installed','Fire Rated','Grille Boxes Installed','Labelled','Penetrations Ready','Subframe & Grilles Installed']
 GROUPS={
   'Ceiling Grid':['Ceiling Grid Installed','Ceiling Tile Ready'],
@@ -55,15 +59,25 @@ async def ensure_db():
         CREATE TABLE IF NOT EXISTS rooms_cache(id TEXT PRIMARY KEY,name TEXT,path TEXT,floor TEXT,updated_at TEXT,hidden INTEGER DEFAULT 0);
         CREATE TABLE IF NOT EXISTS items_cache(id TEXT PRIMARY KEY,room_id TEXT,name TEXT,path TEXT,order_index INTEGER,hidden INTEGER DEFAULT 0,updated_at TEXT);
         CREATE TABLE IF NOT EXISTS status_events(id TEXT PRIMARY KEY,item_id TEXT,status TEXT,note TEXT,updated_at TEXT,client_id TEXT);
-        CREATE TABLE IF NOT EXISTS photos(id TEXT PRIMARY KEY,item_id TEXT,kind TEXT,created_at TEXT,server_id TEXT);
+        CREATE TABLE IF NOT EXISTS photos(id TEXT PRIMARY KEY,item_id TEXT,kind TEXT,created_at TEXT,server_id TEXT, superseded INTEGER DEFAULT 0);
         '''); await db.commit()
+        # migration: ensure 'superseded' exists
+        cur = await db.execute("PRAGMA table_info(photos)")
+        cols = [r[1] for r in await cur.fetchall()]
+        if 'superseded' not in cols:
+            try:
+                await db.execute("ALTER TABLE photos ADD COLUMN superseded INTEGER DEFAULT 0")
+                await db.commit()
+            except Exception:
+                pass
 
 @app.on_event('startup')
 async def _startup():
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     await ensure_db()
     asyncio.create_task(refresh_rooms_periodically())
 
-# --- Graph (light) ---
+# --- Graph (list-only placeholder; upload wiring later) ---
 class Graph:
     def __init__(self, tenant, client_id, client_secret):
         self.tenant=tenant; self.client_id=client_id; self.client_secret=client_secret
@@ -94,7 +108,8 @@ async def scan_rooms():
                 if ch.get('folder'):
                     rid=ch['name']; m=ROOM_NAME_FLOOR.search(rid); floor=m.group(1) if m else ''
                     rooms.append({'id':rid,'name':rid,'path':f'{ROOMS_BASE}/{rid}','floor':floor,'updatedAt':now_iso(),'hidden':0})
-        except Exception: pass
+        except Exception:
+            pass
     return rooms
 
 async def refresh_rooms_periodically():
@@ -106,7 +121,8 @@ async def refresh_rooms_periodically():
                     for r in rooms:
                         await db.execute('INSERT INTO rooms_cache(id,name,path,floor,updated_at,hidden) VALUES(?,?,?,?,?,COALESCE((SELECT hidden FROM rooms_cache WHERE id=?),0)) ON CONFLICT(id) DO UPDATE SET name=excluded.name,path=excluded.path,floor=excluded.floor,updated_at=excluded.updated_at', (r['id'],r['name'],r['path'],r['floor'],r['updatedAt'],r['id']))
                     await db.commit()
-        except Exception: pass
+        except Exception:
+            pass
         await asyncio.sleep(300)
 
 async def items_for_room(room_id:str):
@@ -122,7 +138,8 @@ async def items_for_room(room_id:str):
                 if ch.get('folder'):
                     iid=f'{room_id}::{ch["name"]}'
                     out.append({'id':iid,'roomId':room_id,'name':ch['name'],'path':f'{path}/{ch["name"]}','orderIndex':idx,'hidden':0,'updatedAt':now_iso()})
-        except Exception: pass
+        except Exception:
+            pass
     if not out:
         base=NON_REMOVABLE.copy()
         for i,n in enumerate(base): out.append({'id':f'{room_id}::{n}','roomId':room_id,'name':n,'path':'','orderIndex':i,'hidden':0,'updatedAt':now_iso()})
@@ -132,13 +149,12 @@ async def items_for_room(room_id:str):
         await db.commit()
     return out
 
-# --- Admin session cookie (HMAC with ADMIN_PIN) ---
+# --- Admin session cookie ---
 def sign_admin(exp:int)->str:
     msg=f'adm|{exp}'.encode(); sig=hmac.new(ADMIN_PIN.encode(), msg, hashlib.sha256).hexdigest(); return f'{exp}.{sig}'
 def verify_admin(token:str)->bool:
     try:
-        exp_s, sig = token.split('.',1)
-        exp=int(exp_s)
+        exp_s, sig = token.split('.',1); exp=int(exp_s)
         if time.time()>exp: return False
         expect=hmac.new(ADMIN_PIN.encode(), f'adm|{exp}'.encode(), hashlib.sha256).hexdigest()
         return hmac.compare_digest(expect, sig)
@@ -152,20 +168,6 @@ async def require_admin(request:Request):
 # --- API ---
 @app.get('/healthz')
 async def healthz(): return {'ok':True,'time':now_iso()}
-@app.get('/readiness')
-async def readiness(): return {'ok': os.path.exists(DB_PATH)}
-
-@app.post('/api/admin/login')
-async def admin_login(req:Request, resp:Response):
-    body = await req.json()
-    pin = (body or {}).get('pin','')
-    # If ADMIN_PIN is set, must match; if not set we still require some input (dev only)
-    if (os.getenv('ADMIN_PIN') and pin!=ADMIN_PIN) or (not pin):
-        raise HTTPException(status_code=401, detail='bad pin')
-    exp=int(time.time()+30*60)  # 30 minutes
-    token = sign_admin(exp)
-    resp.set_cookie('adm', token, httponly=True, samesite='lax', max_age=30*60, secure=True)
-    return {'ok':True,'until':exp}
 
 @app.get('/api/rooms')
 async def api_rooms():
@@ -201,29 +203,82 @@ async def api_status(item_id:str, status:str=Form(...), note:Optional[str]=Form(
         await db.execute('INSERT OR IGNORE INTO status_events(id,item_id,status,note,updated_at,client_id) VALUES(?,?,?,?,?,?)',(eid,item_id,status,note,when,clientId)); await db.commit()
     return {'ok':True,'id':eid}
 
+@app.post('/api/items/{item_id}/note')
+async def api_note(item_id:str, req:Request):
+    body=await req.json()
+    text=(body or {}).get('text','').strip()
+    if not text: return {'ok':True}
+    safe = sanitize(item_id)
+    folder = DATA_DIR / 'notes' / safe
+    folder.mkdir(parents=True, exist_ok=True)
+    line = f"{now_iso()} - {text}\n"
+    (folder/'NOTES.txt').write_text(((folder/'NOTES.txt').read_text() if (folder/'NOTES.txt').exists() else '') + line, encoding='utf-8')
+    return {'ok':True}
+
 @app.post('/api/photos/lowres')
 async def api_low(itemId:str=Form(...), photoId:str=Form(...), createdAt:str=Form(...), file:UploadFile=File(...)):
-    dest=pathlib.Path('data/low'); dest.mkdir(parents=True, exist_ok=True)
-    (dest/f'{photoId}.jpg').write_bytes(await file.read())
+    (DATA_DIR/'low').mkdir(parents=True, exist_ok=True)
+    (DATA_DIR/'low'/f'{photoId}.jpg').write_bytes(await file.read())
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute('INSERT OR IGNORE INTO photos(id,item_id,kind,created_at,server_id) VALUES(?,?,?,?,?)',(photoId,itemId,'LOW',createdAt,hashlib.md5((photoId+"low").encode()).hexdigest())); await db.commit()
+        await db.execute('INSERT OR IGNORE INTO photos(id,item_id,kind,created_at,server_id,superseded) VALUES(?,?,?,?,?,0)',(photoId,itemId,'LOW',createdAt,hashlib.md5((photoId+"low").encode()).hexdigest())); await db.commit()
     return {'ok':True}
 
 @app.post('/api/photos/hires')
 async def api_hi(itemId:str=Form(...), photoId:str=Form(...), file:UploadFile=File(...)):
-    dest=pathlib.Path('data/hi'); dest.mkdir(parents=True, exist_ok=True)
-    (dest/f'{photoId}.jpg').write_bytes(await file.read())
+    (DATA_DIR/'hi').mkdir(parents=True, exist_ok=True)
+    (DATA_DIR/'hi'/f'{photoId}.jpg').write_bytes(await file.read())
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute('INSERT OR IGNORE INTO photos(id,item_id,kind,created_at,server_id) VALUES(?,?,?,?,?)',(photoId,itemId,'HI',now_iso(),'')); await db.commit()
+        await db.execute('INSERT OR IGNORE INTO photos(id,item_id,kind,created_at,server_id,superseded) VALUES(?,?,?,?,?,0)',(photoId,itemId,'HI',now_iso(),'')); await db.commit()
     return {'ok':True}
 
 @app.get('/api/items/{item_id}/photos')
 async def api_ph(item_id:str):
     async with aiosqlite.connect(DB_PATH) as db:
-        cur=await db.execute('SELECT id,kind,created_at,server_id FROM photos WHERE item_id=?',(item_id,)); rows=await cur.fetchall()
+        cur=await db.execute('SELECT id,kind,created_at,server_id FROM photos WHERE item_id=? AND IFNULL(superseded,0)=0',(item_id,)); rows=await cur.fetchall()
     return [{'id':r[0],'kind':r[1],'createdAt':r[2],'serverId':r[3]} for r in rows]
 
-# --- Admin visibility/state ---
+@app.post('/api/photos/{photo_id}/supersede')
+async def api_sup(photo_id:str, req:Request):
+    body=await req.json()
+    itemId=(body or {}).get('itemId','')
+    safe = sanitize(itemId)
+    outdir = DATA_DIR/'superseded'/safe
+    outdir.mkdir(parents=True, exist_ok=True)
+    # move local files if they exist
+    for kind, sub in [('LOW','low'),('HI','hi')]:
+        src = DATA_DIR/sub/f'{photo_id}.jpg'
+        if src.exists():
+            dst = outdir/f'{photo_id}.{sub}.jpg'
+            try: shutil.move(str(src), str(dst))
+            except Exception: pass
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('UPDATE photos SET superseded=1 WHERE id=?',(photo_id,))
+        await db.commit()
+    return {'ok':True}
+
+# --- Admin ---
+def redirect_after_hide(hide:bool)->str:
+    return '/' if hide else ''
+
+@app.post('/api/admin/login')
+async def admin_login(req:Request, resp:Response):
+    body = await req.json()
+    pin = (body or {}).get('pin','')
+    if (os.getenv('ADMIN_PIN') and pin!=ADMIN_PIN) or (not pin):
+        raise HTTPException(status_code=401, detail='bad pin')
+    exp=int(time.time()+30*60)
+    token = f'{exp}.{hmac.new(ADMIN_PIN.encode(), f"adm|{exp}".encode(), hashlib.sha256).hexdigest()}'
+    resp.set_cookie('adm', token, httponly=True, samesite='lax', max_age=30*60, secure=True)
+    return {'ok':True,'until':exp}
+
+async def require_admin(request:Request):
+    token = request.cookies.get('adm','')
+    try:
+        exp_s, sig = token.split('.',1); exp=int(exp_s)
+        expect=hmac.new(ADMIN_PIN.encode(), f"adm|{exp}".encode(), hashlib.sha256).hexdigest()
+        if time.time()>exp or not hmac.compare_digest(expect, sig): raise ValueError()
+    except Exception: raise HTTPException(status_code=401, detail='admin required')
+
 @app.get('/api/admin/room-config/{room_id}')
 async def get_room_cfg(room_id:str, _:Any=Depends(require_admin)):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -242,7 +297,6 @@ async def set_room_cfg(room_id:str, req:Request, _:Any=Depends(require_admin)):
     includeGroups = body.get('includeGroups',[]) or []
     hideRoom = bool(body.get('hideRoom', False))
     visible = compute_visible(includeGroups)
-    # ensure items exist
     items = await items_for_room(room_id)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute('UPDATE rooms_cache SET hidden=? WHERE id=?',(1 if hideRoom else 0, room_id))
@@ -250,7 +304,7 @@ async def set_room_cfg(room_id:str, req:Request, _:Any=Depends(require_admin)):
             new_hidden = 0 if (it['name'] in visible or it['name'] in NON_REMOVABLE) else 1
             await db.execute('UPDATE items_cache SET hidden=? WHERE id=?',(new_hidden, it['id']))
         await db.commit()
-    return {'ok':True}
+    return {'ok':True,'redirect': redirect_after_hide(hideRoom)}
 
 @app.post('/api/admin/rooms/hidden-batch')
 async def batch_hide(req:Request, _:Any=Depends(require_admin)):
@@ -280,8 +334,7 @@ async def api_metrics():
             k=floor_id or 'UNK'; floor.setdefault(k,{'rooms':0,'complete':0}); floor[k]['rooms']+=1; floor[k]['complete']+=done
     return {'floors':floor,'time':now_iso()}
 
-# --- Media routes (serve saved photos) ---
-from fastapi import Path
+# --- Media routes ---
 @app.get("/media/low/{photo_id}.jpg")
 async def media_low(photo_id:str=Path(...)):
     p = DATA_DIR / "low" / f"{photo_id}.jpg"
@@ -294,6 +347,15 @@ async def media_hi(photo_id:str=Path(...)):
     if not p.exists(): raise HTTPException(status_code=404)
     return FileResponse(str(p), media_type="image/jpeg")
 
+# --- Simple sync pause/resume toggles (placeholder for Graph push) ---
+SYNC_PAUSED=False
+@app.post('/api/sync/pause')
+async def sync_pause(): 
+    global SYNC_PAUSED; SYNC_PAUSED=True; return {'ok':True,'paused':True}
+@app.post('/api/sync/resume')
+async def sync_resume(): 
+    global SYNC_PAUSED; SYNC_PAUSED=False; return {'ok':True,'paused':False}
+
 # --- SPA routes ---
 @app.get('/', response_class=HTMLResponse)
 async def index(): return FileResponse(str(STATIC_DIR/'index.html'))
@@ -301,4 +363,3 @@ async def index(): return FileResponse(str(STATIC_DIR/'index.html'))
 @app.get('/qa/fd/{damper_id}', response_class=HTMLResponse)
 @app.get('/admin', response_class=HTMLResponse)
 def spa_routes(room_id:Optional[str]=None, damper_id:Optional[str]=None): return FileResponse(str(STATIC_DIR/'index.html'))
- 

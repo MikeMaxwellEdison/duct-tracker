@@ -1,4 +1,4 @@
-﻿:root{--bg:#0b1320;--fg:#e8eef9;--muted:#9fb3d1;--accent:#3aa6ff;--good:#24c16a;--bad:#ff5b5b;--warn:#ffb020}
+﻿:root{--bg:#0b1320;--fg:#e8eef9;--muted:#9fb3d1;--accent:#3aa6ff;--good:#24c16a;--bad:#ff5b5b;--na:#364b6c}
 html,body{margin:0;padding:0;background:#0b1320;color:#e8eef9;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
 .topbar{position:sticky;top:0;background:#0b1f3a;border-bottom:1px solid #173257;padding:10px 12px;z-index:2}
 h1{font-size:16px;margin:0}
@@ -16,6 +16,9 @@ main{padding:12px}
 .seg{display:flex;gap:6px}
 .seg button{min-width:60px;padding:8px 10px;border-radius:8px;border:1px solid #1b365e;background:#13223a;color:#e8eef9}
 .seg button.selected{outline:2px solid var(--accent)}
+.seg button.pass.selected{background:var(--good);border-color:#1b7a49}
+.seg button.fail.selected{background:var(--bad);border-color:#a83a3a}
+.seg button.na.selected{background:var(--na);border-color:#2b3e59}
 .controls{display:flex;gap:10px;margin-top:8px}
 .control{border:1px dashed #254876;border-radius:8px;padding:8px}
 .photo-row{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
@@ -35,11 +38,11 @@ main{padding:12px}
 .lightbox[hidden]{display:none}
 .lightbox-inner{position:relative;max-width:95vw;max-height:85vh}
 .lightbox img{max-width:95vw;max-height:85vh;border-radius:10px;border:1px solid #2a4f85}
-.cam-modal{position:fixed;inset:0;background:#000a;display:flex;align-items:center;justify-content:center;z-index:60}
+.cam-modal{position:fixed;inset:0;background:#000c;display:flex;align-items:center;justify-content:center;z-index:60}
 .cam-modal[hidden]{display:none}
 .cam-inner{position:relative;background:#0b1320;border:1px solid #2a4f85;border-radius:12px;padding:8px}
-#camVideo{width:80vw;max-width:500px;height:auto;border-radius:10px;background:#000}
-.cam-controls{display:flex;align-items:center;justify-content:center;gap:12px;margin-top:8px}
+#camVideo{width:85vw;max-width:520px;height:auto;border-radius:10px;background:#000}
+.cam-controls{display:flex;align-items:center;justify-content:center;gap:8px;margin-top:8px;flex-wrap:wrap}
 .chip{background:#143259;border:1px solid #245c97;padding:6px 10px;border-radius:999px;color:#cfe2ff}
 .drawer{margin-bottom:10px}
 .drawer-h{font-weight:600;margin-bottom:6px}
