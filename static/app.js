@@ -2,25 +2,33 @@
   function $(q,el){ return (el||document).querySelector(q) }
   function $all(q,el){ return Array.prototype.slice.call((el||document).querySelectorAll(q)) }
   function uuid(){ try{ return crypto.randomUUID() }catch(e){ return "u"+Date.now().toString(36)+Math.random().toString(36).slice(2) } }
+  function setChip(txt){ var c=$("#syncChip"); if(c) c.textContent = "Sync: " + txt }
 
   // State
   var GLOBAL_ORDER=["Clash / Issue","Duct Installed","Fire Rated","Grille Boxes Installed","Labelled","Penetrations Ready","Subframe & Grilles Installed","Ceiling Grid Installed","Ceiling Tile Ready","Ceiling Lined","Rondo Frame Ready","LR FD Actuator Installed","LR FD Actuator Wired","LR FD Installed","LR FD Tested","IBD FD Installed","IBD FD Tested","Access Panel Installed","SD Actuator Installed","SD Actuator Wired","SD Installed","SD Tested","VAV Installed","VAV Wired","VCD Actuator Installed","VCD Actuator Wired","VCD Installed"];
   var GROUPS={"Ceiling Grid":["Ceiling Grid Installed","Ceiling Tile Ready"],"Lined Ceiling":["Ceiling Lined","Rondo Frame Ready"],"LR Fire Damper":["LR FD Actuator Installed","LR FD Actuator Wired","LR FD Installed","LR FD Tested"],"IBD Fire Damper":["IBD FD Installed","IBD FD Tested"],"VAV":["VAV Installed","VAV Wired"],"VCD":["VCD Actuator Installed","VCD Actuator Wired","VCD Installed"]};
   var FD_DEP=["Access Panel Installed","SD Actuator Installed","SD Actuator Wired","SD Installed","SD Tested"];
   var NON_REMOVABLE=["Clash / Issue","Duct Installed","Fire Rated","Grille Boxes Installed","Labelled","Penetrations Ready","Subframe & Grilles Installed"];
-  var state={ rooms:[], items:new Map(), notes:new Map(), pinOkUntil:0, currentRoomId:"", camera:{stream:null,count:0,active:false,targets:[],idx:0}, lb:{nodes:[],idx:0} };
+  var state={ rooms:[], items:new Map(), notes:new Map(), pinOkUntil:0, currentRoomId:"", camera:{stream:null,count:0,active:false,targets:[],idx:0}, lb:{nodes:[],idx:0,container:null}, idleTimer:null, syncPaused:false };
 
   // SW
   if("serviceWorker" in navigator){ navigator.serviceWorker.register("/static/sw.js",{scope:"/"}).catch(function(){}) }
 
   // Rings
-  function setRing(el, pct){ pct=Math.max(0,Math.min(100,Math.round(pct||0))); if(!el) return; el.style.background="conic-gradient(var(--good) "+pct+"%, #1a2e4f 0)"; var v=el.querySelector(".ring-val"); if(v) v.textContent=pct+"%"}
+  function setRing(el, pct){ pct=Math.max(0,Math.min(100,Math.round(pct||0))); if(!el) return; el.style.background="conic-gradient(var(--good) "+pct+"%, #1a2e4f 0)"; var v=el.querySelector(".ring-val"); if(v) v.textContent=pct+"%" }
   function fmtPct(a,b){ if(!b||b<=0) return 0; return Math.round(100*a/b) }
-  function metrics(){ fetch("/api/metrics").then(r=>r.json()).then(m=>{ var f=m.floors||{}; var g=f["N-0"]||{rooms:0,complete:0}, l1=f["N-1"]||{rooms:0,complete:0}; setRing($("#ring-ground"),fmtPct(g.complete,g.rooms)); setRing($("#ring-level1"),fmtPct(l1.complete,l1.rooms)); }).catch(()=>{ setRing($("#ring-ground"),0); setRing($("#ring-level1"),0); }) }
+  function metrics(){ fetch("/api/metrics").then(r=>r.json()).then(m=>{ var f=m.floors||{}; var g=f["N-0"]||{rooms:0,complete:0}, l1=f["N-1"]||{rooms:0,complete:0}; setRing($("#ring-ground"),fmtPct(g.complete,g.rooms)); setRing($("#ring-level1"),fmtPct(l1.complete,l1.rooms)); }).catch(()=>{ setRing($("#ring-ground"),0); setRing($("#ring-level1"),0) }) }
 
   // HTTP
   function j(u){ return fetch(u).then(r=>{ if(!r.ok) throw new Error(r.status); return r.json() }) }
   function post(u,b){ return fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b||{})}).then(r=>{ if(!r.ok) throw new Error(r.status); return r.json() }) }
+
+  // Idle sync
+  function bumpIdle(){ if(state.syncPaused) return; if(state.idleTimer) clearTimeout(state.idleTimer); state.idleTimer=setTimeout(pushSync, 3000) }
+  function pauseSync(){ state.syncPaused=true; setChip("paused"); post("/api/sync/pause",{}).catch(()=>{}) }
+  function resumeSync(){ state.syncPaused=false; setChip("idle"); post("/api/sync/resume",{}).catch(()=>{}); bumpIdle() }
+  function pushSync(){ setChip("pushing..."); post("/api/sync/push",{}).then(()=>{ setChip("idle") }).catch(()=>{ setChip("error") }) }
+  $("#syncChip").addEventListener("click", function(){ pushSync() })
 
   // Rooms
   function mountRooms(rs){
@@ -47,11 +55,12 @@
   function pinOk(){ return Date.now()<state.pinOkUntil }
   function ensurePIN(){ if(pinOk()) return Promise.resolve(true); var p=prompt("Enter Admin PIN"); if(!p) return Promise.resolve(false); return post("/api/admin/login",{pin:p}).then(()=>{ state.pinOkUntil=Date.now()+30*60*1000; return true }).catch(()=>{ alert("Incorrect PIN"); return false }) }
 
-  // Checklist rendering
+  // Checklist UI
   function segHTML(sel){ return '<div class="seg">'+
     '<button class="pass'+(sel==="PASS"?' selected':'')+'">PASS</button>'+
     '<button class="fail'+(sel==="FAIL"?' selected':'')+'">FAIL</button>'+
     '<button class="na'+(sel==="NA"?' selected':'')+'">NA</button></div>' }
+
   function renderChecklist(roomId){
     var items=state.items.get(roomId)||[]; var wrap=$("#checklist"); if(!wrap) return; wrap.innerHTML="";
     items.forEach(function(it){
@@ -66,20 +75,25 @@
           '<label class="control"><input type="file" accept="image/*" multiple hidden> 🖼️ Gallery</label>'+
         '</div>'+
         '<div class="photo-row"></div>';
+      // Status exclusive + FD hold prompt on FAIL
       var seg=card.querySelector(".seg");
       seg.addEventListener("click",function(e){
         var t=e.target; if(!t||t.tagName!=="BUTTON") return;
         var val=t.classList.contains("pass")?"PASS":t.classList.contains("fail")?"FAIL":"NA";
         $all("button",seg).forEach(b=>b.classList.remove("selected")); t.classList.add("selected");
-        var note=card.querySelector("textarea").value; state.notes.set(it.id, note);
+        var note=card.querySelector("textarea").value; state.notes.set(it.id,note);
         sendStatus(it.id,val,note);
+        if(it.name.indexOf("FD Tested")>=0 && val==="FAIL"){
+          var rid = prompt("Enter linked room ID for FD HOLD (e.g. N-0.123). Leave blank to skip.");
+          if(rid){ post("/api/fd/hold",{itemId:it.id, linkedRoomId:rid}).then(()=>alert("FD hold linked")).catch(()=>alert("FD hold failed")) }
+        }
       });
-      // Notes: persist to server log on Enter / blur
+      // Notes -> append to log on Enter or blur
       var ta=card.querySelector("textarea");
-      ta.addEventListener("keydown",function(ev){ if(ev.key==="Enter" && !ev.shiftKey){ ev.preventDefault(); persistNote(it.id, ta.value) } });
-      ta.addEventListener("blur", function(){ if(ta.value && ta.value.trim()) persistNote(it.id, ta.value) });
+      ta.addEventListener("keydown",function(ev){ if(ev.key==="Enter" && !ev.shiftKey){ ev.preventDefault(); state.notes.set(it.id, ta.value); post("/api/items/"+encodeURIComponent(it.id)+"/note",{text:ta.value}).finally(bumpIdle) }});
+      ta.addEventListener("blur", function(){ if(ta.value && ta.value.trim()){ state.notes.set(it.id, ta.value); post("/api/items/"+encodeURIComponent(it.id)+"/note",{text:ta.value}).finally(bumpIdle) } });
 
-      // Camera + Gallery
+      // Camera & Gallery
       card.querySelector('[data-cam]').addEventListener("click", function(){ openCameraSession(it, card) });
       var gal=card.querySelector('label.control input[type=file]');
       gal.addEventListener("change", function(){ var files=Array.prototype.slice.call(gal.files||[]); if(!files.length) return; handleFiles(it, card, files) });
@@ -97,30 +111,30 @@
       items=items||[]; items.sort((a,b)=>GLOBAL_ORDER.indexOf(a.name)-GLOBAL_ORDER.indexOf(b.name));
       state.items.set(roomId, items); renderChecklist(roomId);
       if(window.setupViewers) try{ window.setupViewers(roomId) }catch(e){}
-    }).catch(()=>{ state.items.set(roomId, []); renderChecklist(roomId) });
+    }).catch(()=>{ state.items.set(roomId, []); renderChecklist(roomId) })
   }
 
   // Status / notes
   function sendStatus(itemId,status,note){
     var fd=new FormData(); fd.append("status",status||""); if(note) fd.append("note",note); fd.append("updatedAt", new Date().toISOString()); fd.append("clientId", uuid());
-    fetch("/api/items/"+encodeURIComponent(itemId)+"/status",{method:"POST",body:fd}).catch(()=>{});
+    fetch("/api/items/"+encodeURIComponent(itemId)+"/status",{method:"POST",body:fd}).finally(bumpIdle)
   }
-  function persistNote(itemId, text){ post("/api/items/"+encodeURIComponent(itemId)+"/note",{text:text}).catch(()=>{}) }
 
   // Photos
   function handleFiles(it, card, files){
     var thumbs = card.querySelector(".photo-row");
     var con = navigator.connection||{}; var wifi = con.effectiveType ? !/2g|slow-2g/.test(con.effectiveType) : true; var saveData = con.saveData===true;
+    pauseSync();
     files.forEach(function(f){
       low(f).then(function(blob){
-        var pid=uuid();
-        var thumbUrl = URL.createObjectURL(blob);
+        var pid=uuid(); var thumbUrl=URL.createObjectURL(blob);
         addThumb(thumbs, pid, thumbUrl, "/media/low/"+pid+".jpg", it.id);
         var fd=new FormData(); fd.append("itemId",it.id); fd.append("photoId",pid); fd.append("createdAt", new Date().toISOString()); fd.append("file",blob,"low.jpg");
-        fetch("/api/photos/lowres",{method:"POST",body:fd}).catch(()=>{});
-        if(wifi && !saveData){ var fd2=new FormData(); fd2.append("itemId",it.id); fd2.append("photoId",pid); fd2.append("file",f,"hi.jpg"); fetch("/api/photos/hires",{method:"POST",body:fd2}).catch(()=>{}); }
+        fetch("/api/photos/lowres",{method:"POST",body:fd}).finally(bumpIdle);
+        if(wifi && !saveData){ var fd2=new FormData(); fd2.append("itemId",it.id); fd2.append("photoId",pid); fd2.append("file",f,"hi.jpg"); fetch("/api/photos/hires",{method:"POST",body:fd2}).finally(bumpIdle) }
       });
     });
+    setTimeout(resumeSync, 600); // slight delay so UI stays smooth
   }
   function loadPhotos(it, card){
     j("/api/items/"+encodeURIComponent(it.id)+"/photos").then(list=>{
@@ -132,14 +146,14 @@
     var d=document.createElement("div"); d.className="thumb"; d.innerHTML='<img src="'+src+'" data-href="'+href+'" data-id="'+id+'" data-item="'+itemId+'" alt="photo">';
     d.addEventListener("click", function(){
       var imgs = Array.prototype.slice.call(container.querySelectorAll("img"));
-      state.lb.nodes = imgs;
+      state.lb.nodes = imgs; state.lb.container = container;
       state.lb.idx = imgs.findIndex(n=>n.dataset.id===id);
       openLightboxAt(state.lb.idx);
     });
     container.insertBefore(d, container.firstChild);
   }
 
-  // Lightbox
+  // Lightbox with swipe + delete
   function openLightboxAt(i){
     if(!state.lb.nodes || !state.lb.nodes.length) return;
     state.lb.idx = Math.max(0, Math.min(state.lb.nodes.length-1, i));
@@ -147,64 +161,59 @@
     $("#lightboxImg").src = n.dataset.href;
     $("#lightboxImg").setAttribute("data-id", n.dataset.id);
     $("#lightboxImg").setAttribute("data-item", n.dataset.item);
-    $("#lightbox").hidden=false;
-    pauseSync();
+    $("#lightbox").hidden=false; pauseSync();
   }
   function lbPrev(){ if(state.lb.idx>0) openLightboxAt(state.lb.idx-1) }
   function lbNext(){ if(state.lb.idx<state.lb.nodes.length-1) openLightboxAt(state.lb.idx+1) }
   function lbClose(){ $("#lightbox").hidden=true; $("#lightboxImg").src=""; resumeSync() }
   $("#lbPrev").addEventListener("click", lbPrev); $("#lbNext").addEventListener("click", lbNext);
   $("#lightboxClose").addEventListener("click", lbClose);
-  $("#lightbox").addEventListener("click", function(e){ if(e.target.id==="lightbox") lbClose() });
+  // swipe
+  (function(){ var sx=0, sy=0; $("#lightbox").addEventListener("touchstart", function(e){ if(!e.touches[0]) return; sx=e.touches[0].clientX; sy=e.touches[0].clientY }, {passive:true});
+    $("#lightbox").addEventListener("touchend", function(e){ var t=e.changedTouches&&e.changedTouches[0]; if(!t) return; var dx=t.clientX-sx, dy=t.clientY-sy; if(Math.abs(dx)>50 && Math.abs(dy)<40){ if(dx<0) lbNext(); else lbPrev(); } }, {passive:true}) })();
   $("#lightboxDelete").addEventListener("click", function(){
     var id=$("#lightboxImg").getAttribute("data-id"); var item=$("#lightboxImg").getAttribute("data-item");
     if(!id) return;
+    // capture container before removal
+    var cont = state.lb.container;
     post("/api/photos/"+encodeURIComponent(id)+"/supersede",{itemId:item}).then(function(){
-      // remove from current view
-      var cur = state.lb.nodes[state.lb.idx];
-      if(cur && cur.parentElement){ cur.parentElement.remove() }
-      // rebuild nodes from remaining thumbnails
-      if(cur){ var container = cur.closest(".photo-row"); state.lb.nodes = Array.prototype.slice.call(container.querySelectorAll("img")); }
+      // remove thumb div
+      var thumb = cont.querySelector('img[data-id="'+CSS.escape(id)+'"]');
+      if(thumb && thumb.parentElement) thumb.parentElement.remove();
+      // rebuild nodes
+      state.lb.nodes = Array.prototype.slice.call(cont.querySelectorAll("img"));
       if(!state.lb.nodes.length){ lbClose(); return }
       if(state.lb.idx >= state.lb.nodes.length) state.lb.idx = state.lb.nodes.length-1;
       openLightboxAt(state.lb.idx);
+      bumpIdle();
     }).catch(()=>{ alert("Delete failed") });
   });
 
-  // Camera session with Prev/Next and per-item reset
+  // Camera session (Prev/Next)
   function openCameraSession(it, card){
     var modal=$("#camModal"), v=$("#camVideo"), shutter=$("#camShutter"), done=$("#camDone"), count=$("#camCount"), name=$("#camItemName");
     var prevBtn=$("#camPrev"), nextBtn=$("#camNext");
-    // targets = visible checklist items in current room
     state.camera.targets = (state.items.get(state.currentRoomId)||[]).filter(x=>!x.hidden);
     state.camera.idx = state.camera.targets.findIndex(x=>x.id===it.id);
     function setTarget(i){
       state.camera.idx = Math.max(0, Math.min(state.camera.targets.length-1, i));
       it = state.camera.targets[state.camera.idx];
-      card = document.querySelector('[data-item-id="'+CSS.escape(it.id)+'"]').closest(".item");
+      card = document.querySelector('[data-item-id="'+CSS.escape(it.id)+'"]'); if(card) card=card.closest(".item");
       state.camera.count = 0; count.textContent="0/10"; name.textContent = it.name;
     }
     setTarget(state.camera.idx<0?0:state.camera.idx);
     if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
-      // fallback native picker
       var inp=document.createElement("input"); inp.type="file"; inp.accept="image/*"; inp.multiple=true; inp.setAttribute("capture","environment");
       inp.onchange=function(){ var files=Array.prototype.slice.call(inp.files||[]); if(!files.length) return; handleFiles(it, card, files) };
       inp.click(); return;
     }
-    pauseSync();
-    modal.hidden=false; state.camera.active=true;
-    navigator.mediaDevices.getUserMedia({video:{facingMode:"environment"}}).then(function(stream){
-      state.camera.stream=stream; v.srcObject=stream;
-    }).catch(function(){ modal.hidden=true; state.camera.active=false; resumeSync(); });
-
+    pauseSync(); modal.hidden=false; state.camera.active=true;
+    navigator.mediaDevices.getUserMedia({video:{facingMode:"environment"}}).then(function(stream){ state.camera.stream=stream; v.srcObject=stream })
+    .catch(function(){ modal.hidden=true; state.camera.active=false; resumeSync() });
     function take(){
       if(!state.camera.active || state.camera.count>=10) return;
-      var c=document.createElement("canvas"); var w=v.videoWidth||800, h=v.videoHeight||600; c.width=w; c.height=h;
-      c.getContext("2d").drawImage(v,0,0,w,h);
-      c.toBlob(function(blob){
-        state.camera.count++; count.textContent=state.camera.count+"/10";
-        handleFiles(it, card, [new File([blob],"cam.jpg",{type:"image/jpeg"})]);
-      },"image/jpeg",0.85);
+      var c=document.createElement("canvas"); var w=v.videoWidth||800, h=v.videoHeight||600; c.width=w; c.height=h; c.getContext("2d").drawImage(v,0,0,w,h);
+      c.toBlob(function(blob){ state.camera.count++; count.textContent=state.camera.count+"/10"; handleFiles(it, card, [new File([blob],"cam.jpg",{type:"image/jpeg"})]) },"image/jpeg",0.85);
     }
     shutter.onclick=take;
     done.onclick=function(){ try{ state.camera.stream.getTracks().forEach(t=>t.stop()) }catch(e){} modal.hidden=true; state.camera.active=false; resumeSync() };
@@ -215,7 +224,7 @@
   // Helpers
   function low(file){ return new Promise(function(resolve){ var img=new Image(); img.onload=function(){ var max=640; var r=Math.min(max/img.naturalWidth,max/img.naturalHeight,1); var w=Math.round(img.naturalWidth*r),h=Math.round(img.naturalHeight*r); var c=document.createElement("canvas"); c.width=w; c.height=h; c.getContext("2d").drawImage(img,0,0,w,h); c.toBlob(function(b){ resolve(b) },"image/jpeg",0.75) }; img.src=URL.createObjectURL(file) }) }
 
-  // Admin dashboard (hidden rooms only)
+  // Admin dashboard (hidden-only)
   function wireAdminPanel(){
     var btn=$("#adminBtn"); if(!btn) return;
     btn.addEventListener("click", function(){ ensurePIN().then(function(ok){ if(!ok) return;
@@ -225,7 +234,7 @@
       hidden.forEach(function(r){ var row=document.createElement("label"); row.className="switch"; row.innerHTML='<input type="checkbox" '+(r.hidden? "" : "checked")+' data-room="'+r.id+'"> '+r.id; list.appendChild(row) });
       $("#adminSaveHidden").onclick=function(){
         var boxes=$all("#hiddenRooms input[type=checkbox]");
-        var updates = boxes.map(function(b){ return { id:b.getAttribute("data-room"), hidden: !b.checked } }); // hidden = !checked
+        var updates = boxes.map(function(b){ return { id:b.getAttribute("data-room"), hidden: !b.checked } });
         post("/api/admin/rooms/hidden-batch", { rooms: updates }).then(function(){
           boxes.forEach(function(b){ var rm=(state.rooms||[]).find(x=>x.id===b.getAttribute("data-room")); if(rm) rm.hidden = !b.checked; });
           mountRooms(state.rooms); metrics(); alert("Saved");
@@ -235,7 +244,7 @@
     }) })
   }
 
-  // Room Admin (inject ABOVE drawings)
+  // Room Admin placed above drawers; redirect to dashboard if hidden
   function wireRoomAdmin(){
     var pinBtn=$("#pinBtn"); if(!pinBtn) return;
     pinBtn.addEventListener("click", function(){
@@ -258,39 +267,37 @@
             var enabled=$all('input[data-g]:checked', wrap).map(i=>i.getAttribute("data-g"));
             var hideRoom = !!($('#hideRoom', wrap).checked);
             post("/api/admin/room-config/"+encodeURIComponent(rid), { includeGroups: enabled, hideRoom: hideRoom }).then(function(resp){
-              // reflect locally
               var visible={}; NON_REMOVABLE.forEach(function(n){ visible[n]=true });
               enabled.forEach(function(g){ (GROUPS[g]||[]).forEach(function(n){ visible[n]=true }) });
               if(enabled.indexOf("LR Fire Damper")>=0 || enabled.indexOf("IBD Fire Damper")>=0){ FD_DEP.forEach(function(n){ visible[n]=true }) }
-              var items = state.items.get(rid) || [];
-              items.forEach(function(it){ it.hidden = visible[it.name] ? 0 : 1 });
+              var items = state.items.get(rid) || []; items.forEach(function(it){ it.hidden = visible[it.name] ? 0 : 1 });
               var rm=(state.rooms||[]).find(r=>r.id===rid); if(rm){ rm.hidden = hideRoom?1:0 }
-              if(resp && resp.redirect==="/"){ push("/"); nav("dashboard") } else { renderChecklist(rid); mountRooms(state.rooms); }
+              if(resp && resp.redirect==="/"){ push("/"); nav("dashboard"); loadRooms() } else { renderChecklist(rid); mountRooms(state.rooms) }
               metrics(); alert("Saved"); try{ wrap.remove() }catch(e){}
             }).catch(function(){ alert("Save failed") });
           };
           wrap.appendChild(save);
-          var anchor = document.querySelector("#room .drawers");
-          if(anchor && anchor.parentElement){ anchor.parentElement.insertBefore(wrap, anchor) } else { var list=$("#checklist"); if(list){ list.insertBefore(wrap, list.firstChild) } }
+          var anchor = document.querySelector("#room .drawers"); if(anchor && anchor.parentElement){ anchor.parentElement.insertBefore(wrap, anchor) } else { var list=$("#checklist"); if(list){ list.insertBefore(wrap, list.firstChild) } }
         }).catch(function(){ alert("Could not load admin config") });
       })
     })
   }
 
   // Back
-  function wireBackButtons(){ $all(".btn.back").forEach(function(b){ b.addEventListener("click", function(){ var t=b.getAttribute("data-nav")||"dashboard"; if(t==="dashboard"){ push("/") } nav(t) }) }) }
+  function wireBackButtons(){ $all(".btn.back").forEach(function(b){ b.addEventListener("click", function(){ var t=b.getAttribute("data-nav")||"dashboard"; if(t==="dashboard"){ push("/"); loadRooms() } nav(t) }) }) }
 
-  // Search
-  function setupSearch(){ var i=$("#search"); if(!i) return; i.addEventListener("input", function(){ var q=(i.value||"").toLowerCase(); mountRooms((state.rooms||[]).filter(r=>!r.hidden && ((r.id||"").toLowerCase().indexOf(q)>=0 || (r.name||"").toLowerCase().indexOf(q)>=0))) }) }
-
-  // Sync chip pause/resume
-  function setChip(txt){ var c=$("#syncChip"); if(c) c.textContent="Sync: "+txt }
-  function pauseSync(){ setChip("paused"); post("/api/sync/pause",{}) }
-  function resumeSync(){ setChip("idle"); post("/api/sync/resume",{}) }
+  // Search: blur (hide keyboard) on Enter/search
+  function setupSearch(){ var i=$("#search"); if(!i) return;
+    i.addEventListener("input", function(){ var q=(i.value||"").toLowerCase(); mountRooms((state.rooms||[]).filter(r=>!r.hidden && ((r.id||"").toLowerCase().indexOf(q)>=0 || (r.name||"").toLowerCase().indexOf(q)>=0))) });
+    i.addEventListener("keydown", function(e){ if(e.key==="Enter"){ e.preventDefault(); i.blur() } });
+    i.addEventListener("search", function(){ i.blur() });
+  }
 
   // Boot
   document.addEventListener("DOMContentLoaded", function(){
     setupSearch(); loadRooms(); metrics(); wireAdminPanel(); wireRoomAdmin(); wireBackButtons(); route();
     setInterval(metrics,15000);
+    // Global idle triggers
+    ["click","touchend","keyup"].forEach(ev=>document.addEventListener(ev, bumpIdle, {passive:true}));
   });
 })();
