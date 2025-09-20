@@ -9,6 +9,7 @@ const state={ rooms:[], items:new Map(), pinOkUntil:0, currentRoomId:"" };
 
 function fmtPct(a,b){ if(b<=0) return "0%"; return Math.round(100*a/b)+"%"; }
 async function j(u){ const r=await fetch(u); if(!r.ok) throw new Error(await r.text()); return r.json(); }
+async function post(u,body){ const r=await fetch(u,{method:"POST",headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})}); if(!r.ok) throw new Error(await r.text()); return r.json(); }
 
 async function metrics(){
   try{
@@ -97,38 +98,82 @@ async function low(file){
   const c=document.createElement("canvas"); c.width=w; c.height=h; const x=c.getContext("2d"); x.drawImage(img,0,0,w,h);
   const b=await new Promise(res=> c.toBlob(b=>res(b),"image/jpeg",0.75)); URL.revokeObjectURL(img.src); return b;
 }
+
 function pinOk(){ return Date.now()<state.pinOkUntil }
-async function ensurePIN(){ if(pinOk()) return true; const p=prompt("Enter Admin PIN"); if(!p) return false; state.pinOkUntil=Date.now()+30*60*1000; return true }
+async function ensurePIN(){
+  if(pinOk()) return true;
+  const p=prompt("Enter Admin PIN"); if(!p) return false;
+  try{ await post('/api/admin/login',{pin:p}); state.pinOkUntil=Date.now()+30*60*1000; return true }catch{ alert("Incorrect PIN"); return false }
+}
+
 document.getElementById("pinBtn").addEventListener("click", async ()=>{
   if(!(await ensurePIN())) return;
   const rid=state.currentRoomId;
+
+  // fetch current server state for this room
+  let cfg={includeGroups:[], hideRoom:false};
+  try{ cfg = await j(`/api/admin/room-config/${encodeURIComponent(rid)}`) }catch{}
+
   const wrap=document.createElement("div"); wrap.className="item"; wrap.innerHTML='<div class="item-name">Configure Checklist Groups</div>';
-  Object.keys(GROUPS).forEach(g=>{ const r=document.createElement("label"); r.className="switch"; r.innerHTML=`<input type="checkbox" data-g="${g}"> ${g}`; wrap.appendChild(r); });
-  const dep=document.createElement("div"); dep.className="note"; dep.textContent="If LR Fire Damper or IBD Fire Damper is enabled, these are auto-included: "+FD_DEP.join(", "); wrap.appendChild(dep);
-  const hide=document.createElement("label"); hide.className="switch"; hide.innerHTML='<input type="checkbox" id="hideRoom"> Hide this room'; wrap.appendChild(hide);
+
+  // groups start UNTICKED; tick only those currently enabled per server state
+  Object.keys(GROUPS).forEach(g=>{
+    const r=document.createElement("label"); r.className="switch";
+    const checked = cfg.includeGroups?.includes(g) ? 'checked' : '';
+    r.innerHTML=`<input type="checkbox" data-g="${g}" ${checked}> ${g}`;
+    wrap.appendChild(r);
+  });
+
+  const dep=document.createElement("div"); dep.className="note"; dep.textContent="If LR Fire Damper or IBD Fire Damper is enabled, these are auto-included: "+FD_DEP.join(", ");
+  wrap.appendChild(dep);
+
+  const hide=document.createElement("label"); hide.className="switch"; hide.innerHTML=`<input type="checkbox" id="hideRoom" ${cfg.hideRoom?'checked':''}> Hide this room`;
+  wrap.appendChild(hide);
+
   const save=document.createElement("button"); save.className="btn primary"; save.textContent="Save";
-  save.onclick=()=>{
+  save.onclick=async ()=>{
     const enabled=Array.from(wrap.querySelectorAll('input[data-g]:checked')).map(i=>i.dataset.g);
+    const hideRoom = wrap.querySelector('#hideRoom').checked;
+
+    // persist server-side (idempotent)
+    try{ await post(`/api/admin/room-config/${encodeURIComponent(rid)}`, { includeGroups: enabled, hideRoom }) }catch(e){ alert("Save failed"); return }
+
+    // reflect immediately in UI
     const visible=new Set(NON_REMOVABLE);
     enabled.forEach(g=> GROUPS[g].forEach(x=>visible.add(x)));
     if(enabled.includes("LR Fire Damper")||enabled.includes("IBD Fire Damper")) FD_DEP.forEach(x=>visible.add(x));
     const items=state.items.get(rid)||[];
     items.forEach(it=>{ it.hidden = (visible.has(it.name)||NON_REMOVABLE.includes(it.name))?0:1; });
-    renderChecklist(rid); alert("Saved"); wrap.remove();
+
+    // update room hidden flag locally
+    const rm=state.rooms.find(r=>r.id===rid); if(rm){ rm.hidden = hideRoom?1:0 }
+
+    renderChecklist(rid); mountRooms(state.rooms); metrics(); alert("Saved"); wrap.remove();
   };
   wrap.appendChild(save);
-  document.getElementById("checklist").prepend(wrap);
+  document.getElementById("checklist").prepend(wrap)
 });
-document.getElementById("adminBtn").addEventListener("click", ()=>{
+
+document.getElementById("adminBtn").addEventListener("click", async ()=>{
+  // require pin but don't ask again within session
+  if(!(await ensurePIN())) return;
   const list=document.getElementById("hiddenRooms"); list.innerHTML="";
   state.rooms.forEach(r=>{ const row=document.createElement("label"); row.className="switch"; row.innerHTML=`<input type="checkbox" ${(r.hidden? "":"checked")} data-room="${r.id}"> ${r.id}`; list.appendChild(row); });
-  document.getElementById("adminSaveHidden").onclick=()=>{
+  document.getElementById("adminSaveHidden").onclick=async ()=>{
     const boxes=Array.from(list.querySelectorAll('input[type=checkbox]'));
-    boxes.forEach(b=>{ const rm=state.rooms.find(x=>x.id===b.dataset.room); rm.hidden=b.checked?0:1; });
-    mountRooms(state.rooms); alert("Saved");
+    const updates = boxes.map(b=>({ id:b.dataset.room, hidden: b.checked?0:1 })).map(x=>({id:x.id, hidden: x.hidden===1}));
+    // Persist
+    try{ await post('/api/admin/rooms/hidden-batch', { rooms: updates }) }catch(e){ alert('Save failed'); return }
+    // Reflect
+    boxes.forEach(b=>{ const rm=state.rooms.find(r=>r.id===b.dataset.room); if(rm) rm.hidden = b.checked?0:1; });
+    mountRooms(state.rooms); metrics(); alert("Saved");
   };
   nav("adminPanel");
 });
+
 function route(){ const u=new URL(location.href); if(u.pathname.startsWith("/room/")) openRoom(decodeURIComponent(u.pathname.split("/").pop())); else if(u.pathname.startsWith("/admin")) nav("adminPanel"); else nav("dashboard"); }
 window.addEventListener("popstate",route);
 document.addEventListener("DOMContentLoaded",()=>{ setupSearch(); loadRooms(); route(); });
+
+async function setupSearch(){ const i=document.getElementById("search"); i.addEventListener("input",()=>{ const q=i.value.toLowerCase(); mountRooms(state.rooms.filter(r=> (r.id.toLowerCase().includes(q)||r.name.toLowerCase().includes(q)) && !r.hidden)) }) }
+async function low(file){ const img=new Image(); img.src=URL.createObjectURL(file); await img.decode(); const max=640; const r=Math.min(max/img.width,max/img.height,1); const w=Math.round(img.width*r),h=Math.round(img.height*r); const c=document.createElement("canvas"); c.width=w; c.height=h; const x=c.getContext("2d"); x.drawImage(img,0,0,w,h); const b=await new Promise(res=> c.toBlob(b=>res(b),"image/jpeg",0.75)); URL.revokeObjectURL(img.src); return b; }
